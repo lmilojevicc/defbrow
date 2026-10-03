@@ -222,6 +222,17 @@ fn assert_text_color(buffer: &Buffer, x: u16, y: u16, expected: &str, color: Col
     }
 }
 
+fn assert_rail(buffer: &Buffer, y: u16, name: &str, no_color: bool) {
+    assert_text_color(
+        buffer,
+        2,
+        y,
+        "▌",
+        if no_color { Color::Reset } else { Color::Red },
+    );
+    assert_text_color(buffer, 3, y, &format!(" {name}"), Color::Reset);
+}
+
 fn assert_no_protocol_labels(buffer: &Buffer) {
     let rendered = text(buffer);
     assert!(!rendered.to_ascii_uppercase().contains("HTTP"));
@@ -277,12 +288,13 @@ fn render_insets_widgets_and_uses_normal_text_with_tag_only_yellow() {
     let buffer = render_buffer(&picker, false);
     assert_outer_inset(&buffer);
     assert_text_color(&buffer, 1, 1, "┌", Color::DarkGray);
-    assert_text_color(&buffer, 2, 1, "Search", Color::Reset);
+    assert_text_color(&buffer, 2, 1, "Search", Color::LightMagenta);
     assert_text_color(&buffer, 8, 1, "─", Color::DarkGray);
     assert_text_color(&buffer, 2, 2, "a", Color::Reset);
     assert_text_color(&buffer, 1, 4, "┌", Color::DarkGray);
-    assert_text_color(&buffer, 2, 4, "Browsers (2)", Color::Reset);
-    assert_text_color(&buffer, 2, 5, "> Alpha", Color::Reset);
+    assert_text_color(&buffer, 2, 4, "Browsers (2)", Color::Green);
+    assert_text_color(&buffer, 2, 5, "▌", Color::Red);
+    assert_text_color(&buffer, 3, 5, " Alpha", Color::Reset);
     assert_text_color(&buffer, 4, 6, "Beta ", Color::Reset);
     assert_text_color(&buffer, 9, 6, "[current]", Color::Yellow);
     assert_text_color(
@@ -296,9 +308,20 @@ fn render_insets_widgets_and_uses_normal_text_with_tag_only_yellow() {
         for x in 0..buffer.area.width {
             let cell = &buffer[(x, y)];
             assert_eq!(cell.fg == Color::Yellow, y == 6 && (9..18).contains(&x));
+            assert_eq!(cell.fg == Color::Red, y == 5 && x == 2);
+            assert_eq!(cell.fg == Color::Green, y == 4 && (2..14).contains(&x));
+            assert_eq!(
+                cell.fg == Color::LightMagenta,
+                y == 1 && (2..8).contains(&x)
+            );
             assert!(matches!(
                 cell.fg,
-                Color::Reset | Color::DarkGray | Color::Yellow
+                Color::Reset
+                    | Color::DarkGray
+                    | Color::Yellow
+                    | Color::Green
+                    | Color::LightMagenta
+                    | Color::Red
             ));
         }
     }
@@ -320,7 +343,8 @@ fn render_selected_current_tag_stays_yellow_without_coloring_name_or_spacing() {
     picker.handle_key(key(KeyCode::Down), true);
     let buffer = render_buffer(&picker, false);
     assert_text_color(&buffer, 2, 5, "  Alpha", Color::Reset);
-    assert_text_color(&buffer, 2, 6, "> Beta ", Color::Reset);
+    assert_text_color(&buffer, 2, 6, "▌", Color::Red);
+    assert_text_color(&buffer, 3, 6, " Beta ", Color::Reset);
     assert_text_color(&buffer, 9, 6, "[current]", Color::Yellow);
     for y in 0..buffer.area.height {
         for x in 0..buffer.area.width {
@@ -354,9 +378,25 @@ fn render_preserves_list_and_footer_inside_inset_at_minimum_usable_size() {
             Color::DarkGray
         };
         assert_outer_inset(&buffer);
-        assert_text_color(&buffer, 2, 1, "Search", Color::Reset);
-        assert_text_color(&buffer, 2, 4, "Browsers (5)", Color::Reset);
-        assert_text_color(&buffer, 2, 5, "> Alpha", Color::Reset);
+        assert_text_color(
+            &buffer,
+            2,
+            1,
+            "Search",
+            if no_color {
+                Color::Reset
+            } else {
+                Color::LightMagenta
+            },
+        );
+        assert_text_color(
+            &buffer,
+            2,
+            4,
+            "Browsers (5)",
+            if no_color { Color::Reset } else { Color::Green },
+        );
+        assert_rail(&buffer, 5, "Alpha", no_color);
         assert_text_color(&buffer, 4, 6, "Beta", Color::Reset);
         assert_text_color(&buffer, 1, 7, "└", border_color);
         assert_text_color(&buffer, 1, 8, "↑/↓ move", border_color);
@@ -367,7 +407,7 @@ fn render_preserves_list_and_footer_inside_inset_at_minimum_usable_size() {
     picker.handle_key(key(KeyCode::Up), true);
     for no_color in [false, true] {
         let buffer = render_buffer_at_size(&picker, no_color, 32, 10);
-        assert_text_color(&buffer, 2, 6, "> Epsilon", Color::Reset);
+        assert_rail(&buffer, 6, "Epsilon", no_color);
         assert_selection_background(&buffer, Some(6), no_color);
         assert_outer_inset(&buffer);
     }
@@ -386,7 +426,7 @@ fn render_no_color_inherits_palette_and_keeps_selection_and_current_distinct() {
         },
     );
     picker.set_query("a".into());
-    for (selected_y, pointer_text) in [(5, "> Alpha"), (6, "> Beta")] {
+    for (selected_y, pointer_text) in [(5, "▌ Alpha"), (6, "▌ Beta")] {
         let buffer = render_buffer(&picker, true);
         assert_text_color(&buffer, 2, 1, "Search", Color::Reset);
         assert_text_color(&buffer, 2, 2, "a", Color::Reset);
@@ -501,7 +541,7 @@ fn render_only_shows_details_to_disambiguate_duplicate_names() {
                 Color::DarkGray
             },
         );
-        assert_text_color(&buffer, 2, 6, "> Alpha", Color::Reset);
+        assert_rail(&buffer, 6, "Alpha", no_color);
         assert_text_color(
             &buffer,
             9,
@@ -513,7 +553,7 @@ fn render_only_shows_details_to_disambiguate_duplicate_names() {
     }
     picker.set_query("/Users/me".into());
     let buffer = render_buffer(&picker, false);
-    assert_text_color(&buffer, 2, 5, "> Alpha", Color::Reset);
+    assert_rail(&buffer, 5, "Alpha", false);
     assert_text_color(
         &buffer,
         9,
@@ -564,7 +604,7 @@ fn render_selected_duplicate_details_contrast_with_shading_and_preserve_current_
                     },
                 );
             }
-            assert_text_color(&buffer, 2, selected_y, "> Alpha", Color::Reset);
+            assert_rail(&buffer, selected_y, "Alpha", no_color);
             assert_selection_background(&buffer, Some(selected_y), no_color);
             assert_outer_inset(&buffer);
         }
@@ -701,6 +741,77 @@ fn render_disables_confirmation_just_below_minimum_and_at_tiny_sizes() {
             }
         }
     }
+}
+
+#[test]
+fn status_is_sanitized_inline_and_preserves_help_inset_and_selection() {
+    let mut picker = Picker::new(vec![browser("a", "Alpha", "")], CurrentDefaults::default());
+    picker.set_status("Could not set Alpha:\n\u{1b}[31m native\t\u{9b}failure");
+    assert_eq!(
+        picker.status(),
+        "Could not set Alpha:  [31m native  failure"
+    );
+    for no_color in [false, true] {
+        for (width, height) in [(100, 20), (32, 10)] {
+            let buffer = render_buffer_at_size(&picker, no_color, width, height);
+            assert_outer_inset(&buffer);
+            assert_text_color(&buffer, 1, height - 3, "Could not set Alpha:", Color::Reset);
+            assert_text_color(
+                &buffer,
+                1,
+                height - 2,
+                "↑/↓ move",
+                if no_color {
+                    Color::Reset
+                } else {
+                    Color::DarkGray
+                },
+            );
+            assert_rail(&buffer, 5, "Alpha", no_color);
+            assert_selection_background(&buffer, Some(5), no_color);
+            assert!(buffer
+                .content
+                .iter()
+                .all(|cell| cell.symbol().chars().all(|c| !c.is_control())));
+            if no_color {
+                assert!(buffer
+                    .content
+                    .iter()
+                    .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+            }
+        }
+    }
+}
+
+#[test]
+fn refresh_keeps_identity_or_selects_first_remaining_match() {
+    let mut picker = Picker::new(
+        vec![browser("a", "Alpha", ""), browser("b", "Beta", "")],
+        CurrentDefaults::default(),
+    );
+    picker.set_query("a".into());
+    picker.handle_key(key(KeyCode::Down), true);
+    picker.refresh(
+        Some(vec![browser("b", "Beta", ""), browser("a", "Alpha", "")]),
+        CurrentDefaults::default(),
+    );
+    assert_eq!(picker.query(), "a");
+    assert_eq!(picker.selected_browser().unwrap().id, "b");
+    picker.refresh(
+        Some(vec![browser("a", "Alpha", "")]),
+        CurrentDefaults::default(),
+    );
+    assert_eq!(picker.selected_browser().unwrap().id, "a");
+    picker.refresh(Some(Vec::new()), CurrentDefaults::default());
+    assert!(picker.selected_browser().is_none());
+    assert_eq!(
+        picker.handle_key(key(KeyCode::Enter), true),
+        PickerAction::Continue
+    );
+    assert_eq!(
+        picker.handle_key(key(KeyCode::Esc), true),
+        PickerAction::Cancel
+    );
 }
 
 #[test]

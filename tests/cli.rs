@@ -3,6 +3,10 @@ use std::{
     process::Command as ProcessCommand,
 };
 
+#[cfg(unix)]
+#[path = "support/pty.rs"]
+mod pty;
+
 use anyhow::{bail, Result};
 use clap::Parser;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -28,18 +32,40 @@ struct FakeBackend {
     sets: Cell<usize>,
     partial: bool,
     fail: bool,
+    fail_once: Cell<bool>,
+    readback_fails: bool,
+    refresh_fails: bool,
+    refreshed_browsers: Option<Vec<Browser>>,
+    expect_restored_terminal: bool,
 }
 
 impl Backend for FakeBackend {
     fn browsers(&self) -> Result<Vec<Browser>> {
-        Ok(self.browsers.clone())
+        if self.refresh_fails && self.sets.get() > 0 {
+            bail!("Fixture refresh\nfailed");
+        }
+        Ok(if self.sets.get() > 0 {
+            self.refreshed_browsers
+                .as_ref()
+                .unwrap_or(&self.browsers)
+                .clone()
+        } else {
+            self.browsers.clone()
+        })
     }
     fn current(&self) -> Result<CurrentDefaults> {
+        if self.readback_fails && self.sets.get() > 0 {
+            bail!("Fixture readback\u{1b}failed");
+        }
         Ok(self.current.borrow().clone())
     }
     fn set_default(&self, browser: &Browser) -> Result<()> {
+        if self.expect_restored_terminal {
+            assert!(!crossterm::terminal::is_raw_mode_enabled()?);
+            println!("MOCK-SET-{}", self.sets.get() + 1);
+        }
         self.sets.set(self.sets.get() + 1);
-        if self.fail {
+        if self.fail || self.fail_once.replace(false) {
             bail!("Fixture rejection: HTTP=old, HTTPS=old");
         }
         self.current.borrow_mut().http = Some(browser.id.clone());
@@ -50,8 +76,38 @@ impl Backend for FakeBackend {
     }
 }
 
-fn no_picker(_: Vec<Browser>, _: CurrentDefaults) -> Result<Option<Browser>> {
+fn no_picker(_: Picker, _: &mut dyn FnMut(&mut Picker, &Browser)) -> Result<()> {
     panic!("Explicit subcommands must not invoke the picker")
+}
+
+fn rendered(picker: &Picker) -> String {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    terminal
+        .draw(|frame| {
+            defbrow::ui::render(
+                frame,
+                picker,
+                &mut ratatui::widgets::ListState::default(),
+                true,
+            );
+        })
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+fn choose(picker: &mut Picker) -> Browser {
+    let PickerAction::Select(browser) =
+        picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), true)
+    else {
+        panic!("Expected selection")
+    };
+    browser
 }
 
 #[test]
@@ -144,10 +200,9 @@ fn escape_and_control_c_cancel_without_setters() {
             ..Default::default()
         };
         let mut output = Vec::new();
-        execute(&backend, None, &mut output, |browsers, current| {
-            let mut picker = Picker::new(browsers, current);
+        execute(&backend, None, &mut output, |mut picker, _| {
             assert_eq!(picker.handle_key(key, true), PickerAction::Cancel);
-            Ok(None)
+            Ok(())
         })
         .unwrap();
         assert_eq!(backend.sets.get(), 0);
@@ -156,30 +211,157 @@ fn escape_and_control_c_cancel_without_setters() {
 }
 
 #[test]
-fn selected_browser_sets_only_after_picker_returns() {
+fn selected_browser_sets_within_session_then_refreshes_and_cancels() {
     let backend = FakeBackend {
         browsers: vec![browser("a", "Alpha")],
         ..Default::default()
     };
     let mut output = Vec::new();
-    let returned = Cell::new(false);
-    execute(&backend, None, &mut output, |browsers, current| {
-        let mut picker = Picker::new(browsers, current);
+    execute(&backend, None, &mut output, |mut picker, switch| {
         assert_eq!(backend.sets.get(), 0);
         let PickerAction::Select(browser) =
             picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), true)
         else {
             panic!("Expected selection")
         };
-        returned.set(true);
-        Ok(Some(browser))
+        switch(&mut picker, &browser);
+        assert_eq!(backend.sets.get(), 1);
+        assert_eq!(picker.status(), "Default browser: Alpha");
+        assert!(rendered(&picker).contains("Alpha [current]"));
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
+            PickerAction::Cancel
+        );
+        Ok(())
     })
     .unwrap();
-    assert!(returned.get());
     assert_eq!(backend.sets.get(), 1);
-    assert!(String::from_utf8(output)
-        .unwrap()
-        .contains("Default browser: Alpha"));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn interactive_rejection_keeps_picker_usable_for_retry_or_cancel() {
+    for retry in [false, true] {
+        let backend = FakeBackend {
+            browsers: vec![browser("a", "Alpha"), browser("b", "Beta")],
+            current: RefCell::new(CurrentDefaults {
+                http: Some("b".into()),
+                https: Some("b".into()),
+            }),
+            fail_once: Cell::new(true),
+            ..Default::default()
+        };
+        execute(&backend, None, &mut Vec::new(), |mut picker, switch| {
+            let browser = choose(&mut picker);
+            switch(&mut picker, &browser);
+            assert!(picker.status().contains("Could not set Alpha"));
+            let screen = rendered(&picker);
+            assert!(screen.contains("Beta [current]"));
+            assert!(!screen.contains("Alpha [current]"));
+            if retry {
+                let browser = choose(&mut picker);
+                switch(&mut picker, &browser);
+                assert_eq!(picker.status(), "Default browser: Alpha");
+                assert!(rendered(&picker).contains("Alpha [current]"));
+            }
+            assert_eq!(
+                picker.handle_key(
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    true
+                ),
+                PickerAction::Cancel
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(backend.sets.get(), if retry { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn interactive_readback_refresh_and_mismatch_are_truthful_and_recoverable() {
+    for (readback_fails, refresh_fails, partial) in [
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
+        let backend = FakeBackend {
+            browsers: vec![browser("a", "Alpha"), browser("old", "Old")],
+            current: RefCell::new(CurrentDefaults {
+                http: Some("old".into()),
+                https: Some("old".into()),
+            }),
+            readback_fails,
+            refresh_fails,
+            partial,
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        execute(&backend, None, &mut output, |mut picker, switch| {
+            let browser = choose(&mut picker);
+            switch(&mut picker, &browser);
+            assert!(picker.status().chars().all(|c| !c.is_control()));
+            let screen = rendered(&picker);
+            if readback_fails {
+                assert!(picker.status().contains("current unknown"));
+                assert!(!picker.status().starts_with("Default browser:"));
+                assert!(!screen.contains("[current]"));
+            } else {
+                assert!(screen.contains("Alpha [current]"));
+            }
+            if refresh_fails {
+                assert!(picker.status().contains("previous entries shown"));
+                assert_eq!(picker.visible_browsers().count(), 2);
+            }
+            if partial {
+                assert!(picker.status().contains("not verified"));
+                assert!(!picker.status().starts_with("Default browser:"));
+                assert!(screen.contains("Old [current]"));
+            }
+            picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), true);
+            assert_eq!(picker.selected_browser().unwrap().id, "old");
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
+                PickerAction::Cancel
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(backend.sets.get(), 1);
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn interactive_refresh_preserves_filter_and_selected_identity_with_new_entries() {
+    let backend = FakeBackend {
+        browsers: vec![browser("a", "Alpha"), browser("b", "Beta")],
+        refreshed_browsers: Some(vec![
+            browser("new", "Aardvark"),
+            browser("b", "Beta"),
+            browser("a", "Alpha"),
+        ]),
+        ..Default::default()
+    };
+    execute(&backend, None, &mut Vec::new(), |mut picker, switch| {
+        picker.set_query("a".into());
+        picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), true);
+        let browser = choose(&mut picker);
+        assert_eq!(browser.id, "b");
+        switch(&mut picker, &browser);
+        assert_eq!(picker.query(), "a");
+        assert_eq!(picker.visible_browsers().count(), 3);
+        assert_eq!(picker.selected_browser().unwrap().id, "b");
+        assert!(rendered(&picker).contains("Beta [current]"));
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
+            PickerAction::Cancel
+        );
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(backend.sets.get(), 1);
 }
 
 #[test]
@@ -204,6 +386,30 @@ fn unknown_ambiguous_and_picker_errors_do_not_set() {
     ))
     .is_err());
     assert_eq!(backend.sets.get(), 0);
+}
+
+#[test]
+fn one_shot_set_uses_human_confirmation_and_returns_after_one_change() {
+    let backend = FakeBackend {
+        browsers: vec![browser("a", "Alpha")],
+        ..Default::default()
+    };
+    let mut output = Vec::new();
+    execute(
+        &backend,
+        Some(&Command::Set {
+            browser: "a".into(),
+        }),
+        &mut output,
+        no_picker,
+    )
+    .unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output
+        .starts_with("Setting default browser to Alpha. OS confirmation may be required...\n"));
+    assert!(output.ends_with("Default browser: Alpha\n"));
+    assert!(!output.contains("HTTP"));
+    assert_eq!(backend.sets.get(), 1);
 }
 
 #[test]
@@ -238,6 +444,43 @@ fn setter_rejection_or_partial_change_never_prints_success() {
             assert!(error.to_string().contains("Fixture rejection"));
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_picker_stays_in_same_process_after_success_or_failure_and_restores_terminal() {
+    for mode in ["success", "reject-once"] {
+        let mut session = pty::Session::start(mode);
+        session.wait_for("Search");
+        session.send(b"\r");
+        session.wait_for(if mode == "success" {
+            "Default browser: Alpha"
+        } else {
+            "Could not set Alpha"
+        });
+        // A second Enter must reach a second fake setter within this same session.
+        session.send(b"\r");
+        session.wait_for("Default browser: Alpha");
+        session.send(b"\x1b");
+        session.finish();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess fixture invoked only through a fake-backend PTY session"]
+fn native_picker_fixture() {
+    let mode = std::env::var("DEFBROW_TEST_PICKER").expect("PTY fixture requires its test parent");
+    let backend = FakeBackend {
+        browsers: vec![browser("a", "Alpha")],
+        fail_once: Cell::new(mode == "reject-once"),
+        expect_restored_terminal: true,
+        ..Default::default()
+    };
+    execute(&backend, None, &mut Vec::new(), defbrow::ui::pick).unwrap();
+    assert_eq!(backend.sets.get(), 2);
+    assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+    println!("MOCK-SESSION-CANCELLED");
 }
 
 #[test]

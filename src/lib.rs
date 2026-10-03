@@ -50,12 +50,12 @@ pub fn resolve_browser<'a>(browsers: &'a [Browser], query: &str) -> Result<&'a B
     Ok(browser)
 }
 
-// Picker owns only selection; setting happens after it returns and restores the terminal.
+// The session suspends its terminal before invoking the switch callback.
 pub fn execute(
     backend: &dyn Backend,
     command: Option<&Command>,
     output: &mut dyn Write,
-    picker: impl FnOnce(Vec<Browser>, CurrentDefaults) -> Result<Option<Browser>>,
+    picker: impl FnOnce(ui::Picker, &mut dyn FnMut(&mut ui::Picker, &Browser)) -> Result<()>,
 ) -> Result<()> {
     match command {
         Some(Command::List) => {
@@ -84,18 +84,57 @@ pub fn execute(
         None => {
             let browsers = backend.browsers()?;
             let current = backend.current()?;
-            if let Some(browser) = picker(browsers, current)? {
-                set_browser(backend, &browser, output)?;
-            }
+            picker(
+                ui::Picker::new(browsers, current),
+                &mut |picker, browser| {
+                    switch_interactively(backend, picker, browser);
+                },
+            )?;
         }
     }
     Ok(())
 }
 
+fn switch_interactively(backend: &dyn Backend, picker: &mut ui::Picker, browser: &Browser) {
+    let set_result = backend.set_default(browser);
+    // Read actual state even after rejection: native setters can make partial changes.
+    let current_result = backend.current();
+    let browsers_result = backend.browsers();
+    let mut status = match &set_result {
+        Err(error) => format!("Could not set {}: {error:#}", browser.name),
+        Ok(()) => match &current_result {
+            Ok(current)
+                if current.http.as_deref() == Some(&browser.id)
+                    && current.https.as_deref() == Some(&browser.id) =>
+            {
+                format!("Default browser: {}", browser.name)
+            }
+            Ok(_) => format!(
+                "Change to {} not verified; defaults differ. A partial change may have occurred.",
+                browser.name
+            ),
+            Err(_) => format!("Change to {} requested, but not verified.", browser.name),
+        },
+    };
+    if let Err(error) = &current_result {
+        status.push_str(&format!(
+            " Reading defaults failed (current unknown): {error:#}"
+        ));
+    }
+    if let Err(error) = &browsers_result {
+        status.push_str(&format!(
+            " Browser refresh failed (previous entries shown): {error:#}"
+        ));
+    }
+    // Unknown readback clears stale markers instead of presenting an old default as fact.
+    picker.refresh(browsers_result.ok(), current_result.unwrap_or_default());
+    picker.set_status(status);
+}
+
 fn set_browser(backend: &dyn Backend, browser: &Browser, output: &mut dyn Write) -> Result<()> {
     writeln!(
         output,
-        "Setting HTTP and HTTPS to {}. OS confirmation may be required...",
+        "Setting default browser to {}. OS confirmation may be required...",
         display_text(&browser.name)
     )?;
     output.flush()?;

@@ -5,7 +5,7 @@ use crossterm::{
     cursor::Show,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
@@ -51,6 +51,7 @@ pub struct Picker {
     query: String,
     visible: Vec<usize>,
     selected: Option<usize>,
+    status: String,
 }
 
 impl Picker {
@@ -63,6 +64,32 @@ impl Picker {
             query: String::new(),
             visible,
             selected,
+            status: String::new(),
+        }
+    }
+
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub fn set_status(&mut self, status: impl AsRef<str>) {
+        self.status = display_text(status.as_ref());
+    }
+
+    /// Keep the filter and selected identity across readback, never inventing defaults.
+    pub fn refresh(&mut self, browsers: Option<Vec<Browser>>, current: CurrentDefaults) {
+        let selected_id = self.selected_browser().map(|browser| browser.id.clone());
+        if let Some(browsers) = browsers {
+            self.browsers = browsers;
+        }
+        self.current = current;
+        self.set_query(self.query.clone());
+        if let Some(index) = self
+            .visible
+            .iter()
+            .position(|&index| Some(&self.browsers[index].id) == selected_id.as_ref())
+        {
+            self.selected = Some(index);
         }
     }
 
@@ -203,6 +230,7 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),
+        Constraint::Length(u16::from(!picker.status.is_empty())),
         Constraint::Length(1),
     ])
     .split(area);
@@ -211,13 +239,13 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
         .block(
             Block::bordered()
                 .border_style(subdued_style)
-                .title_style(Style::default().fg(Color::Reset))
+                .title_style(palette_style(no_color, Color::LightMagenta))
                 .title("Search"),
         );
     frame.render_widget(search, areas[0]);
     let block = Block::bordered()
         .border_style(subdued_style)
-        .title_style(Style::default().fg(Color::Reset))
+        .title_style(palette_style(no_color, Color::Green))
         .title(format!("Browsers ({})", picker.visible.len()));
     if picker.visible.is_empty() {
         let message = if picker.browsers.is_empty() {
@@ -236,7 +264,15 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
             .enumerate()
             .map(|(index, browser)| {
                 let name = display_text(&browser.name);
-                let mut spans = vec![Span::raw(name.clone())];
+                let mut spans = vec![
+                    if picker.selected == Some(index) {
+                        Span::styled("▌", palette_style(no_color, Color::Red))
+                    } else {
+                        Span::raw(" ")
+                    },
+                    Span::raw(" "),
+                    Span::raw(name.clone()),
+                ];
                 if !current_marker(browser, &picker.current).is_empty() {
                     spans.push(Span::raw(" "));
                     spans.push(Span::styled("[current]", current_style));
@@ -261,7 +297,7 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
                     };
                     // Gray details would disappear against the selected row's gray background.
                     let detail_style = if picker.selected == Some(index) {
-                        Style::default().fg(Color::Reset)
+                        Style::default()
                     } else {
                         subdued_style
                     };
@@ -277,15 +313,15 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
             List::new(items)
                 .style(Style::default())
                 .block(block)
-                .highlight_symbol("> ")
                 .highlight_style(selection_style(no_color)),
             areas[1],
             state,
         );
     }
+    frame.render_widget(Paragraph::new(picker.status.as_str()), areas[2]);
     frame.render_widget(
         Paragraph::new("↑/↓ move · Enter set · Esc cancel · Ctrl-U clear").style(subdued_style),
-        areas[2],
+        areas[3],
     );
     true
 }
@@ -314,27 +350,40 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn pick(browsers: Vec<Browser>, current: CurrentDefaults) -> Result<Option<Browser>> {
+/// Switch callbacks run only with the terminal restored, so native OS prompts can work.
+pub fn pick(mut picker: Picker, switch: &mut dyn FnMut(&mut Picker, &Browser)) -> Result<()> {
     if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
         bail!("The picker needs a terminal. Use `defbrow list` or `defbrow set <id>` instead.");
     }
     let mut guard = TerminalGuard { active: true };
     // ratatui also installs a hook that restores the terminal before printing a panic.
     let mut terminal = ratatui::try_init().context("Failed to initialize terminal")?;
-    let mut picker = Picker::new(browsers, current);
     let mut state = ListState::default();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-    let result = loop {
+    loop {
         let mut can_select = false;
         terminal.draw(|frame| can_select = render(frame, &picker, &mut state, no_color))?;
         if let Event::Key(key) = event::read()? {
             match picker.handle_key(key, can_select) {
                 PickerAction::Continue => {}
-                PickerAction::Cancel => break None,
-                PickerAction::Select(browser) => break Some(browser),
+                PickerAction::Cancel => break,
+                PickerAction::Select(browser) => {
+                    match guard.restore() {
+                        Ok(()) => switch(&mut picker, &browser),
+                        Err(error) => picker.set_status(format!(
+                            "No change requested: terminal suspension failed: {error:#}"
+                        )),
+                    }
+                    // Keep the model and scroll state; clear invalidated screen buffers.
+                    guard.active = true;
+                    enable_raw_mode().context("Failed to resume terminal raw mode")?;
+                    execute!(io::stdout(), EnterAlternateScreen)
+                        .context("Failed to resume terminal screen")?;
+                    terminal.clear()?;
+                }
             }
         }
-    };
+    }
     guard.restore()?;
-    Ok(result)
+    Ok(())
 }
