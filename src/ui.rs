@@ -10,6 +10,7 @@ use crossterm::{
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
     Frame,
 };
@@ -194,58 +195,91 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
     }
     let areas = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(2),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
     .split(area);
     frame.render_widget(
-        Paragraph::new("defbrow — choose a browser").style(accent_style(no_color)),
+        Paragraph::new("defbrow — choose a browser")
+            .style(accent_style(no_color).add_modifier(Modifier::BOLD)),
         areas[0],
     );
-    frame.render_widget(
-        Paragraph::new(format!(
-            "HTTP: {}\nHTTPS: {}",
-            display_text(picker.current.http.as_deref().unwrap_or("(none)")),
-            display_text(picker.current.https.as_deref().unwrap_or("(none)"))
-        )),
-        areas[1],
+    let search_style = if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    let search = Paragraph::new(display_text(&picker.query)).block(
+        Block::bordered()
+            .border_style(accent_style(no_color))
+            .title(Span::styled("Search", search_style)),
     );
-    let search = Paragraph::new(display_text(&picker.query))
-        .block(Block::bordered().title("Search (fuzzy)"));
-    frame.render_widget(search, areas[2]);
-    let block = Block::bordered().title(format!("Browsers ({})", picker.visible.len()));
+    frame.render_widget(search, areas[1]);
+    let block = Block::bordered()
+        .border_style(accent_style(no_color))
+        .title(Span::styled(
+            format!("Browsers ({})", picker.visible.len()),
+            accent_style(no_color),
+        ));
     if picker.visible.is_empty() {
         let message = if picker.browsers.is_empty() {
-            "No registered HTTP+HTTPS handlers."
+            "No browsers found."
         } else {
             "No matching browsers. Ctrl-U clears."
         };
-        frame.render_widget(Paragraph::new(message).block(block), areas[3]);
+        frame.render_widget(Paragraph::new(message).block(block), areas[2]);
     } else {
+        let current_style = if no_color {
+            Style::default()
+        } else {
+            Style::default().fg(Color::Green)
+        }
+        .add_modifier(Modifier::BOLD);
         let items = picker.visible_browsers().map(|browser| {
-            ListItem::new(format!(
-                "{} {} — {} — {}",
-                display_text(&browser.name),
-                current_marker(browser, &picker.current),
-                display_text(&browser.id),
-                display_text(&browser.detail)
-            ))
+            let name = display_text(&browser.name);
+            let mut spans = vec![Span::raw(name.clone())];
+            if !current_marker(browser, &picker.current).is_empty() {
+                spans.push(Span::styled(" [current]", current_style));
+            }
+            // Details only disambiguate namesakes, including ones hidden by the query.
+            let namesakes: Vec<_> = picker
+                .browsers
+                .iter()
+                .filter(|other| display_text(&other.name) == name)
+                .collect();
+            if namesakes.len() > 1 {
+                let detail = if browser.detail.is_empty()
+                    || namesakes
+                        .iter()
+                        .filter(|other| other.detail == browser.detail)
+                        .count()
+                        > 1
+                {
+                    &browser.id
+                } else {
+                    &browser.detail
+                };
+                spans.push(Span::styled(
+                    format!(" — {}", display_text(detail)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         });
         state.select(picker.selected);
         frame.render_stateful_widget(
             List::new(items)
                 .block(block)
                 .highlight_symbol("> ")
-                .highlight_style(selection_style()),
-            areas[3],
+                .highlight_style(accent_style(no_color).patch(selection_style())),
+            areas[2],
             state,
         );
     }
     frame.render_widget(
         Paragraph::new("↑/↓ move · Enter set · Esc cancel · Ctrl-U clear"),
-        areas[4],
+        areas[3],
     );
     true
 }
