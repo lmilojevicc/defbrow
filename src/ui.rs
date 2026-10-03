@@ -207,7 +207,7 @@ pub fn selection_style(no_color: bool) -> Style {
         Style::default()
     } else {
         // Only shade the row: a foreground here would override the current tag.
-        Style::default().bg(Color::DarkGray)
+        Style::default().bg(Color::Indexed(237))
     }
 }
 
@@ -240,13 +240,19 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
             Block::bordered()
                 .border_style(subdued_style)
                 .title_style(palette_style(no_color, Color::LightMagenta))
-                .title("Search"),
+                .title(Line::from(vec![
+                    Span::styled("─ ", subdued_style),
+                    Span::raw("Search"),
+                ])),
         );
     frame.render_widget(search, areas[0]);
     let block = Block::bordered()
         .border_style(subdued_style)
         .title_style(palette_style(no_color, Color::Green))
-        .title(format!("Browsers ({})", picker.visible.len()));
+        .title(Line::from(vec![
+            Span::styled("─ ", subdued_style),
+            Span::raw(format!("Browsers ({})", picker.visible.len())),
+        ]));
     if picker.visible.is_empty() {
         let message = if picker.browsers.is_empty() {
             "No browsers found."

@@ -262,7 +262,7 @@ fn assert_selection_background(buffer: &Buffer, selected_y: Option<u16>, no_colo
         for x in 0..buffer.area.width {
             let expected =
                 if !no_color && Some(y) == selected_y && (2..buffer.area.width - 2).contains(&x) {
-                    Color::DarkGray
+                    Color::Indexed(237)
                 } else {
                     Color::Reset
                 };
@@ -288,11 +288,14 @@ fn render_insets_widgets_and_uses_normal_text_with_tag_only_yellow() {
     let buffer = render_buffer(&picker, false);
     assert_outer_inset(&buffer);
     assert_text_color(&buffer, 1, 1, "┌", Color::DarkGray);
-    assert_text_color(&buffer, 2, 1, "Search", Color::LightMagenta);
-    assert_text_color(&buffer, 8, 1, "─", Color::DarkGray);
+    assert_text_color(&buffer, 2, 1, "─ ", Color::DarkGray);
+    assert_text_color(&buffer, 4, 1, "Search", Color::LightMagenta);
+    assert_text_color(&buffer, 10, 1, "─", Color::DarkGray);
     assert_text_color(&buffer, 2, 2, "a", Color::Reset);
     assert_text_color(&buffer, 1, 4, "┌", Color::DarkGray);
-    assert_text_color(&buffer, 2, 4, "Browsers (2)", Color::Green);
+    assert_text_color(&buffer, 2, 4, "─ ", Color::DarkGray);
+    assert_text_color(&buffer, 4, 4, "Browsers (2)", Color::Green);
+    assert_text_color(&buffer, 16, 4, "─", Color::DarkGray);
     assert_text_color(&buffer, 2, 5, "▌", Color::Red);
     assert_text_color(&buffer, 3, 5, " Alpha", Color::Reset);
     assert_text_color(&buffer, 4, 6, "Beta ", Color::Reset);
@@ -309,10 +312,10 @@ fn render_insets_widgets_and_uses_normal_text_with_tag_only_yellow() {
             let cell = &buffer[(x, y)];
             assert_eq!(cell.fg == Color::Yellow, y == 6 && (9..18).contains(&x));
             assert_eq!(cell.fg == Color::Red, y == 5 && x == 2);
-            assert_eq!(cell.fg == Color::Green, y == 4 && (2..14).contains(&x));
+            assert_eq!(cell.fg == Color::Green, y == 4 && (4..16).contains(&x));
             assert_eq!(
                 cell.fg == Color::LightMagenta,
-                y == 1 && (2..8).contains(&x)
+                y == 1 && (4..10).contains(&x)
             );
             assert!(matches!(
                 cell.fg,
@@ -380,7 +383,7 @@ fn render_preserves_list_and_footer_inside_inset_at_minimum_usable_size() {
         assert_outer_inset(&buffer);
         assert_text_color(
             &buffer,
-            2,
+            4,
             1,
             "Search",
             if no_color {
@@ -391,11 +394,24 @@ fn render_preserves_list_and_footer_inside_inset_at_minimum_usable_size() {
         );
         assert_text_color(
             &buffer,
-            2,
+            4,
             4,
             "Browsers (5)",
             if no_color { Color::Reset } else { Color::Green },
         );
+        for (y, title_end) in [(1, 10), (4, 16)] {
+            assert_text_color(&buffer, 1, y, "┌─ ", border_color);
+            assert_text_color(
+                &buffer,
+                title_end,
+                y,
+                &"─".repeat(usize::from(30 - title_end)),
+                border_color,
+            );
+            assert_text_color(&buffer, 30, y, "┐", border_color);
+        }
+        assert_text_color(&buffer, 2, 2, " ", Color::Reset);
+        assert_text_color(&buffer, 1, 3, "└", border_color);
         assert_rail(&buffer, 5, "Alpha", no_color);
         assert_text_color(&buffer, 4, 6, "Beta", Color::Reset);
         assert_text_color(&buffer, 1, 7, "└", border_color);
@@ -428,7 +444,10 @@ fn render_no_color_inherits_palette_and_keeps_selection_and_current_distinct() {
     picker.set_query("a".into());
     for (selected_y, pointer_text) in [(5, "▌ Alpha"), (6, "▌ Beta")] {
         let buffer = render_buffer(&picker, true);
-        assert_text_color(&buffer, 2, 1, "Search", Color::Reset);
+        assert_text_color(&buffer, 2, 1, "─ ", Color::Reset);
+        assert_text_color(&buffer, 4, 1, "Search", Color::Reset);
+        assert_text_color(&buffer, 2, 4, "─ ", Color::Reset);
+        assert_text_color(&buffer, 4, 4, "Browsers (2)", Color::Reset);
         assert_text_color(&buffer, 2, 2, "a", Color::Reset);
         assert_text_color(&buffer, 2, selected_y, pointer_text, Color::Reset);
         assert_text_color(&buffer, 9, 6, "[current]", Color::Reset);
@@ -445,7 +464,7 @@ fn render_no_color_inherits_palette_and_keeps_selection_and_current_distinct() {
     assert_eq!(ui::selection_style(true).fg, None);
     assert_eq!(ui::selection_style(true).bg, None);
     assert_eq!(ui::selection_style(false).fg, None);
-    assert_eq!(ui::selection_style(false).bg, Some(Color::DarkGray));
+    assert_eq!(ui::selection_style(false).bg, Some(Color::Indexed(237)));
 }
 
 #[test]
@@ -726,6 +745,8 @@ fn render_disables_confirmation_just_below_minimum_and_at_tiny_sizes() {
             let buffer = terminal.backend().buffer();
             assert_outer_inset(buffer);
             assert_selection_background(buffer, None, no_color);
+            assert!(!text(buffer).contains("Search"));
+            assert!(!text(buffer).contains("Browsers"));
             if width > 1 && height > 1 {
                 assert_text_color(
                     buffer,
