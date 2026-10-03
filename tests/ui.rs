@@ -191,7 +191,11 @@ fn text(buffer: &Buffer) -> String {
 }
 
 fn render_buffer(picker: &Picker, no_color: bool) -> Buffer {
-    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    render_buffer_at_size(picker, no_color, 100, 20)
+}
+
+fn render_buffer_at_size(picker: &Picker, no_color: bool, width: u16, height: u16) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| {
             assert!(ui::render(
@@ -205,13 +209,17 @@ fn render_buffer(picker: &Picker, no_color: bool) -> Buffer {
     terminal.backend().buffer().clone()
 }
 
-fn colored_text(buffer: &Buffer, color: Color) -> String {
-    buffer
-        .content
-        .iter()
-        .filter(|cell| cell.fg == color)
-        .map(|cell| cell.symbol())
-        .collect()
+fn assert_text_color(buffer: &Buffer, x: u16, y: u16, expected: &str, color: Color) {
+    for (offset, character) in expected.chars().enumerate() {
+        let cell = &buffer[(x + offset as u16, y)];
+        assert_eq!(cell.symbol(), character.to_string());
+        assert_eq!(
+            cell.fg,
+            color,
+            "wrong color at ({}, {y})",
+            x + offset as u16
+        );
+    }
 }
 
 fn assert_no_protocol_labels(buffer: &Buffer) {
@@ -219,11 +227,13 @@ fn assert_no_protocol_labels(buffer: &Buffer) {
     assert!(!rendered.to_ascii_uppercase().contains("HTTP"));
     assert!(!rendered.contains("fuzzy"));
     assert!(!rendered.contains("backend"));
+    assert!(!rendered.contains("defbrow"));
+    assert!(!rendered.contains("choose a browser"));
 }
 
 #[test]
-fn render_colors_title_borders_search_selection_and_current_with_ansi_palette() {
-    let picker = Picker::new(
+fn render_uses_requested_ansi_palette_for_each_widget() {
+    let mut picker = Picker::new(
         vec![
             browser("raw.alpha.id", "Alpha", "/path/to/Alpha.app"),
             browser("raw.beta.id", "Beta", "/path/to/Beta.app"),
@@ -233,41 +243,94 @@ fn render_colors_title_borders_search_selection_and_current_with_ansi_palette() 
             https: Some("raw.beta.id".into()),
         },
     );
+    picker.set_query("a".into());
     let buffer = render_buffer(&picker, false);
-    assert!(colored_text(&buffer, Color::Cyan).contains("defbrow — choose a browser"));
-    assert!(buffer
+    assert_text_color(&buffer, 1, 0, "Search", Color::LightMagenta);
+    assert_text_color(&buffer, 7, 0, "─", Color::DarkGray);
+    assert_text_color(&buffer, 1, 1, "a", Color::LightMagenta);
+    assert_text_color(&buffer, 1, 3, "Browsers (2)", Color::Green);
+    assert_text_color(&buffer, 1, 4, "> Alpha", Color::Green);
+    assert_text_color(&buffer, 3, 5, "Beta [current]", Color::Green);
+    assert_text_color(
+        &buffer,
+        0,
+        19,
+        "↑/↓ move · Enter set · Esc cancel · Ctrl-U clear",
+        Color::DarkGray,
+    );
+    let borders: Vec<_> = buffer
         .content
         .iter()
-        .any(|cell| cell.symbol() == "│" && cell.fg == Color::Cyan));
-    assert!(colored_text(&buffer, Color::Yellow).contains("Search"));
-    assert!(!text(&buffer).contains("(fuzzy)"));
-    assert!(colored_text(&buffer, Color::Cyan).contains("> Alpha"));
-    assert!(colored_text(&buffer, Color::Green).contains("[current]"));
+        .filter(|cell| matches!(cell.symbol(), "│" | "─" | "┌" | "┐" | "└" | "┘"))
+        .collect();
+    assert!(!borders.is_empty());
+    assert!(borders.iter().all(|cell| cell.fg == Color::DarkGray));
     assert!(buffer.content.iter().all(|cell| cell.bg == Color::Reset));
     assert!(buffer.content.iter().all(|cell| matches!(
         cell.fg,
-        Color::Reset | Color::Cyan | Color::Yellow | Color::Green
+        Color::Reset | Color::DarkGray | Color::Green | Color::LightMagenta
     )));
-    assert!(buffer
-        .content
-        .iter()
-        .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
-        .any(|cell| cell.symbol() == "A" && cell.fg == Color::Cyan));
+    assert!(buffer[(3, 4)].modifier.contains(Modifier::REVERSED));
+    assert!(buffer[(8, 5)].modifier.contains(Modifier::BOLD));
     assert_no_protocol_labels(&buffer);
     assert!(!text(&buffer).contains("raw."));
     assert!(!text(&buffer).contains("/path/to/"));
 }
 
 #[test]
-fn render_no_color_inherits_palette_and_keeps_selection_and_current_distinct() {
+fn render_reclaims_header_row_for_list_at_minimum_usable_size() {
     let picker = Picker::new(
-        vec![browser("a", "Alpha", ""), browser("b", "Beta", "")],
+        vec![
+            browser("a", "Alpha", ""),
+            browser("b", "Beta", ""),
+            browser("c", "Gamma", ""),
+            browser("d", "Delta", ""),
+            browser("e", "Epsilon", ""),
+        ],
+        CurrentDefaults::default(),
+    );
+    for no_color in [false, true] {
+        let buffer = render_buffer_at_size(&picker, no_color, 32, 10);
+        let search_color = if no_color {
+            Color::Reset
+        } else {
+            Color::LightMagenta
+        };
+        let browser_color = if no_color { Color::Reset } else { Color::Green };
+        let border_color = if no_color {
+            Color::Reset
+        } else {
+            Color::DarkGray
+        };
+        assert_text_color(&buffer, 1, 0, "Search", search_color);
+        assert_text_color(&buffer, 1, 3, "Browsers (5)", browser_color);
+        for (y, name) in [(4, "Alpha"), (5, "Beta"), (6, "Gamma"), (7, "Delta")] {
+            assert_text_color(&buffer, 3, y, name, browser_color);
+        }
+        assert_text_color(&buffer, 0, 8, "└", border_color);
+        assert_text_color(&buffer, 0, 9, "↑/↓ move", border_color);
+        assert!(!text(&buffer).contains("Epsilon"));
+        assert_no_protocol_labels(&buffer);
+    }
+}
+
+#[test]
+fn render_no_color_inherits_palette_and_keeps_selection_and_current_distinct() {
+    let mut picker = Picker::new(
+        vec![
+            browser("a", "Alpha", "first-copy"),
+            browser("b", "Beta", ""),
+            browser("c", "Alpha", "second-copy"),
+        ],
         CurrentDefaults {
             http: Some("b".into()),
             https: Some("b".into()),
         },
     );
+    picker.set_query("a".into());
     let buffer = render_buffer(&picker, true);
+    assert_text_color(&buffer, 1, 0, "Search", Color::Reset);
+    assert_text_color(&buffer, 1, 1, "a", Color::Reset);
     assert!(buffer
         .content
         .iter()
@@ -345,6 +408,18 @@ fn render_only_shows_details_to_disambiguate_duplicate_names() {
     assert!(!rendered.contains("hidden-detail"));
     assert!(!rendered.contains("shared-detail"));
     assert_no_protocol_labels(&buffer);
+    assert_text_color(&buffer, 3, 4, "Alpha", Color::Green);
+    assert_text_color(&buffer, 8, 4, " — /Applications/Alpha.app", Color::DarkGray);
+    assert_text_color(&buffer, 3, 5, "Alpha", Color::Green);
+    assert_text_color(
+        &buffer,
+        8,
+        5,
+        " — /Users/me/Applications/Alpha.app",
+        Color::DarkGray,
+    );
+    assert!(buffer[(11, 4)].modifier.contains(Modifier::DIM));
+    assert!(buffer[(11, 5)].modifier.contains(Modifier::DIM));
     picker.set_query("/Users/me".into());
     assert!(
         text(&render_buffer(&picker, false)).contains("Alpha — /Users/me/Applications/Alpha.app")
@@ -370,6 +445,17 @@ fn render_handles_empty_no_match_and_resize() {
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert!(text(buffer).contains("No browsers found."));
+        assert_text_color(
+            buffer,
+            1,
+            4,
+            "No browsers found.",
+            if no_color {
+                Color::Reset
+            } else {
+                Color::DarkGray
+            },
+        );
         assert_no_protocol_labels(buffer);
         assert!(!text(buffer).contains("raw.unknown.id"));
     }
@@ -377,16 +463,40 @@ fn render_handles_empty_no_match_and_resize() {
     picker.set_query("zzz".into());
     terminal
         .draw(|frame| {
-            ui::render(frame, &picker, &mut state, true);
+            ui::render(frame, &picker, &mut state, false);
         })
         .unwrap();
-    assert!(text(terminal.backend().buffer()).contains("No matching browsers."));
+    assert_text_color(
+        terminal.backend().buffer(),
+        1,
+        4,
+        "No matching browsers. Ctrl-U clears.",
+        Color::DarkGray,
+    );
     assert_no_protocol_labels(terminal.backend().buffer());
     terminal.backend_mut().resize(20, 5);
-    terminal
-        .draw(|frame| assert!(!ui::render(frame, &picker, &mut state, true)))
-        .unwrap();
-    assert!(text(terminal.backend().buffer()).contains("Resize"));
+    for no_color in [false, true] {
+        terminal
+            .draw(|frame| assert!(!ui::render(frame, &picker, &mut state, no_color)))
+            .unwrap();
+        assert_text_color(
+            terminal.backend().buffer(),
+            0,
+            0,
+            "Resize",
+            if no_color {
+                Color::Reset
+            } else {
+                Color::DarkGray
+            },
+        );
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .all(|cell| cell.bg == Color::Reset));
+    }
     terminal.backend_mut().resize(80, 20);
     terminal
         .draw(|frame| assert!(ui::render(frame, &picker, &mut state, true)))

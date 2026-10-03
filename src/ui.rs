@@ -167,11 +167,11 @@ pub fn current_marker(browser: &Browser, current: &CurrentDefaults) -> &'static 
     }
 }
 
-pub fn accent_style(no_color: bool) -> Style {
+fn palette_style(no_color: bool, color: Color) -> Style {
     if no_color {
         Style::default()
     } else {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(color)
     }
 }
 
@@ -186,41 +186,35 @@ pub fn usable_size(area: Rect) -> bool {
 /// Returns whether selection is visible and safe to confirm at this size.
 pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_color: bool) -> bool {
     let area = frame.area();
+    let subdued_style = palette_style(no_color, Color::DarkGray);
+    let browser_style = palette_style(no_color, Color::Green);
+    let search_style = palette_style(no_color, Color::LightMagenta);
     if !usable_size(area) {
         frame.render_widget(
-            Paragraph::new("Resize to at least 32x10. Esc cancels."),
+            Paragraph::new("Resize to at least 32x10. Esc cancels.").style(subdued_style),
             area,
         );
         return false;
     }
     let areas = Layout::vertical([
-        Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
     .split(area);
-    frame.render_widget(
-        Paragraph::new("defbrow — choose a browser")
-            .style(accent_style(no_color).add_modifier(Modifier::BOLD)),
-        areas[0],
-    );
-    let search_style = if no_color {
-        Style::default()
-    } else {
-        Style::default().fg(Color::Yellow)
-    };
-    let search = Paragraph::new(display_text(&picker.query)).block(
-        Block::bordered()
-            .border_style(accent_style(no_color))
-            .title(Span::styled("Search", search_style)),
-    );
-    frame.render_widget(search, areas[1]);
+    let search = Paragraph::new(display_text(&picker.query))
+        .style(search_style)
+        .block(
+            Block::bordered()
+                .border_style(subdued_style)
+                .title(Span::styled("Search", search_style)),
+        );
+    frame.render_widget(search, areas[0]);
     let block = Block::bordered()
-        .border_style(accent_style(no_color))
+        .border_style(subdued_style)
         .title(Span::styled(
             format!("Browsers ({})", picker.visible.len()),
-            accent_style(no_color),
+            browser_style,
         ));
     if picker.visible.is_empty() {
         let message = if picker.browsers.is_empty() {
@@ -228,14 +222,12 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
         } else {
             "No matching browsers. Ctrl-U clears."
         };
-        frame.render_widget(Paragraph::new(message).block(block), areas[2]);
+        frame.render_widget(
+            Paragraph::new(message).style(subdued_style).block(block),
+            areas[1],
+        );
     } else {
-        let current_style = if no_color {
-            Style::default()
-        } else {
-            Style::default().fg(Color::Green)
-        }
-        .add_modifier(Modifier::BOLD);
+        let current_style = browser_style.add_modifier(Modifier::BOLD);
         let items = picker.visible_browsers().map(|browser| {
             let name = display_text(&browser.name);
             let mut spans = vec![Span::raw(name.clone())];
@@ -262,7 +254,7 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
                 };
                 spans.push(Span::styled(
                     format!(" — {}", display_text(detail)),
-                    Style::default().add_modifier(Modifier::DIM),
+                    subdued_style.add_modifier(Modifier::DIM),
                 ));
             }
             ListItem::new(Line::from(spans))
@@ -270,16 +262,17 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
         state.select(picker.selected);
         frame.render_stateful_widget(
             List::new(items)
+                .style(browser_style)
                 .block(block)
                 .highlight_symbol("> ")
-                .highlight_style(accent_style(no_color).patch(selection_style())),
-            areas[2],
+                .highlight_style(selection_style()),
+            areas[1],
             state,
         );
     }
     frame.render_widget(
-        Paragraph::new("↑/↓ move · Enter set · Esc cancel · Ctrl-U clear"),
-        areas[3],
+        Paragraph::new("↑/↓ move · Enter set · Esc cancel · Ctrl-U clear").style(subdued_style),
+        areas[2],
     );
     true
 }
