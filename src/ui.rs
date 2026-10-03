@@ -8,7 +8,7 @@ use crossterm::{
     terminal::{disable_raw_mode, LeaveAlternateScreen},
 };
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
@@ -175,8 +175,13 @@ fn palette_style(no_color: bool, color: Color) -> Style {
     }
 }
 
-pub fn selection_style() -> Style {
-    Style::default().add_modifier(Modifier::REVERSED)
+pub fn selection_style(no_color: bool) -> Style {
+    if no_color {
+        Style::default()
+    } else {
+        // Only shade the row: a foreground here would override the current tag.
+        Style::default().bg(Color::DarkGray)
+    }
 }
 
 pub fn usable_size(area: Rect) -> bool {
@@ -185,11 +190,10 @@ pub fn usable_size(area: Rect) -> bool {
 
 /// Returns whether selection is visible and safe to confirm at this size.
 pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_color: bool) -> bool {
-    let area = frame.area();
+    let outer = frame.area();
+    let area = outer.inner(Margin::new(1, 1));
     let subdued_style = palette_style(no_color, Color::DarkGray);
-    let browser_style = palette_style(no_color, Color::Green);
-    let search_style = palette_style(no_color, Color::LightMagenta);
-    if !usable_size(area) {
+    if !usable_size(outer) {
         frame.render_widget(
             Paragraph::new("Resize to at least 32x10. Esc cancels.").style(subdued_style),
             area,
@@ -203,19 +207,18 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
     ])
     .split(area);
     let search = Paragraph::new(display_text(&picker.query))
-        .style(search_style)
+        .style(Style::default())
         .block(
             Block::bordered()
                 .border_style(subdued_style)
-                .title(Span::styled("Search", search_style)),
+                .title_style(Style::default().fg(Color::Reset))
+                .title("Search"),
         );
     frame.render_widget(search, areas[0]);
     let block = Block::bordered()
         .border_style(subdued_style)
-        .title(Span::styled(
-            format!("Browsers ({})", picker.visible.len()),
-            browser_style,
-        ));
+        .title_style(Style::default().fg(Color::Reset))
+        .title(format!("Browsers ({})", picker.visible.len()));
     if picker.visible.is_empty() {
         let message = if picker.browsers.is_empty() {
             "No browsers found."
@@ -227,45 +230,55 @@ pub fn render(frame: &mut Frame, picker: &Picker, state: &mut ListState, no_colo
             areas[1],
         );
     } else {
-        let current_style = browser_style.add_modifier(Modifier::BOLD);
-        let items = picker.visible_browsers().map(|browser| {
-            let name = display_text(&browser.name);
-            let mut spans = vec![Span::raw(name.clone())];
-            if !current_marker(browser, &picker.current).is_empty() {
-                spans.push(Span::styled(" [current]", current_style));
-            }
-            // Details only disambiguate namesakes, including ones hidden by the query.
-            let namesakes: Vec<_> = picker
-                .browsers
-                .iter()
-                .filter(|other| display_text(&other.name) == name)
-                .collect();
-            if namesakes.len() > 1 {
-                let detail = if browser.detail.is_empty()
-                    || namesakes
-                        .iter()
-                        .filter(|other| other.detail == browser.detail)
-                        .count()
-                        > 1
-                {
-                    &browser.id
-                } else {
-                    &browser.detail
-                };
-                spans.push(Span::styled(
-                    format!(" — {}", display_text(detail)),
-                    subdued_style.add_modifier(Modifier::DIM),
-                ));
-            }
-            ListItem::new(Line::from(spans))
-        });
+        let current_style = palette_style(no_color, Color::Yellow).add_modifier(Modifier::BOLD);
+        let items = picker
+            .visible_browsers()
+            .enumerate()
+            .map(|(index, browser)| {
+                let name = display_text(&browser.name);
+                let mut spans = vec![Span::raw(name.clone())];
+                if !current_marker(browser, &picker.current).is_empty() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled("[current]", current_style));
+                }
+                // Details only disambiguate namesakes, including ones hidden by the query.
+                let namesakes: Vec<_> = picker
+                    .browsers
+                    .iter()
+                    .filter(|other| display_text(&other.name) == name)
+                    .collect();
+                if namesakes.len() > 1 {
+                    let detail = if browser.detail.is_empty()
+                        || namesakes
+                            .iter()
+                            .filter(|other| other.detail == browser.detail)
+                            .count()
+                            > 1
+                    {
+                        &browser.id
+                    } else {
+                        &browser.detail
+                    };
+                    // Gray details would disappear against the selected row's gray background.
+                    let detail_style = if picker.selected == Some(index) {
+                        Style::default().fg(Color::Reset)
+                    } else {
+                        subdued_style
+                    };
+                    spans.push(Span::styled(
+                        format!(" — {}", display_text(detail)),
+                        detail_style.add_modifier(Modifier::DIM),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            });
         state.select(picker.selected);
         frame.render_stateful_widget(
             List::new(items)
-                .style(browser_style)
+                .style(Style::default())
                 .block(block)
                 .highlight_symbol("> ")
-                .highlight_style(selection_style()),
+                .highlight_style(selection_style(no_color)),
             areas[1],
             state,
         );
