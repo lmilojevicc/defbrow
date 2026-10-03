@@ -175,25 +175,119 @@ fn installed_browser(url: &NSURL) -> Option<Browser> {
     if !Path::new(&executable).is_file() {
         return None;
     }
-    let name = ["CFBundleDisplayName", "CFBundleName"]
-        .into_iter()
-        .find_map(|key| {
-            let value = bundle.objectForInfoDictionaryKey(&NSString::from_str(key))?;
-            let name = value.downcast_ref::<NSString>()?.to_string();
-            (!name.trim().is_empty()).then_some(name)
-        })
-        .unwrap_or_else(|| {
-            Path::new(&id)
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        });
-    let detail = match bundle.bundleIdentifier() {
+    let metadata_name = |key| {
+        let value = bundle.objectForInfoDictionaryKey(&NSString::from_str(key))?;
+        let name = value.downcast_ref::<NSString>()?.to_string();
+        (!name.trim().is_empty()).then_some(name)
+    };
+    let display_name = metadata_name("CFBundleDisplayName");
+    let bundle_name = metadata_name("CFBundleName");
+    let bundle_id = bundle.bundleIdentifier().map(|value| value.to_string());
+    if !eligible_browser_install(
+        Path::new(&id),
+        bundle_id.as_deref(),
+        bundle_name.as_deref(),
+        display_name.as_deref(),
+    ) {
+        return None;
+    }
+    let name = display_name.or(bundle_name).unwrap_or_else(|| {
+        Path::new(&id)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
+    let detail = match bundle_id {
         Some(bundle_id) => format!("{bundle_id} — {id}"),
         None => id.clone(),
     };
     Some(Browser { id, name, detail })
+}
+
+// Eligibility applies only to candidates, never current(). Canonical paths prevent
+// aliases from admitting cached copies; set_default() reuses this discovery gate.
+// Reject dedicated cache/staging locations, not browser families or release channels.
+fn eligible_browser_install(
+    path: &Path,
+    bundle_id: Option<&str>,
+    bundle_name: Option<&str>,
+    display_name: Option<&str>,
+) -> bool {
+    if bundle_id == Some("com.google.chrome.for.testing")
+        || [
+            bundle_name,
+            display_name,
+            path.file_stem().and_then(|s| s.to_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|name| name == "Google Chrome for Testing")
+    {
+        return false;
+    }
+
+    for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+        if ancestor.file_name().is_some_and(|name| {
+            [
+                ".cloakbrowser",
+                ".fragrantica-archiver",
+                ".cache",
+                "ms-playwright",
+                ".puppeteer",
+            ]
+            .iter()
+            .any(|excluded| name == *excluded)
+        }) || [
+            "Library/Caches",
+            ".agent-browser/browsers",
+            ".omp/puppeteer",
+            "puppeteer/.local-chromium",
+            "puppeteer-core/.local-chromium",
+            "puppeteer/.local-browsers",
+            "puppeteer-core/.local-browsers",
+        ]
+        .iter()
+        .any(|suffix| ancestor.ends_with(suffix))
+        {
+            return false;
+        }
+    }
+
+    if ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"]
+        .iter()
+        .any(|root| path.starts_with(root))
+    {
+        return false;
+    }
+    // Darwin's per-user temporary/cache roots: /[private/]var/folders/<shard>/<user>/T|C.
+    for root in ["/var/folders", "/private/var/folders"] {
+        if let Ok(relative) = path.strip_prefix(root) {
+            if relative
+                .iter()
+                .nth(2)
+                .is_some_and(|part| part == "T" || part == "C")
+            {
+                return false;
+            }
+        }
+    }
+
+    // Mozilla updater's downloaded staging bundle is not a user-installed copy.
+    let parts: Vec<_> = path.iter().collect();
+    if let [.., update_info, applications, _, updates, stage, updated] = parts.as_slice() {
+        if *update_info == "UpdateInfo"
+            && *applications == "Applications"
+            && *updates == "updates"
+            && *updated == "Updated.app"
+            && stage.to_str().is_some_and(|stage| {
+                !stage.is_empty() && stage.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn common_browsers(http: Vec<Browser>, https: Vec<Browser>) -> Vec<Browser> {
@@ -300,6 +394,163 @@ mod tests {
             id: id.into(),
             name: name.into(),
             detail: id.into(),
+        }
+    }
+
+    #[test]
+    fn eligibility_excludes_dedicated_automation_caches_and_temporary_roots() {
+        for path in [
+            "/Users/milo/.cloakbrowser/chromium-145.0.7632.109.2/Chromium.app",
+            "/Users/milo/Projects/fragtrack/.fragrantica-archiver/chromium-145.0.7632.109.2/Chromium.app",
+            "/Users/milo/.cache/rod/browser/chromium-1321438/Chromium.app",
+            "/Users/milo/Library/Caches/ms-playwright/firefox-1538/firefox/Nightly.app",
+            "/Users/milo/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app",
+            "/opt/downloads/ms-playwright/chromium/Chromium.app",
+            "/Users/milo/.agent-browser/browsers/chrome-151.0.7922.47/Google Chrome for Testing.app",
+            "/Users/milo/.omp/puppeteer/chrome/mac_arm-150.0.7871.24/chrome-mac-arm64/Google Chrome for Testing.app",
+            "/Users/milo/.puppeteer/chrome/Chromium.app",
+            "/Users/milo/.vscode/extensions/yzane.markdown-pdf-1.5.0/node_modules/puppeteer-core/.local-chromium/mac-722234/chrome-mac/Chromium.app",
+            "/opt/node_modules/puppeteer/.local-chromium/chrome/Chromium.app",
+            "/opt/node_modules/puppeteer-core/.local-browsers/chrome/Chromium.app",
+            "/opt/node_modules/puppeteer/.local-browsers/chrome/Chromium.app",
+            "/tmp/browser/Chromium.app",
+            "/private/tmp/browser/Chromium.app",
+            "/var/tmp/browser/Chromium.app",
+            "/private/var/tmp/browser/Chromium.app",
+            "/var/folders/p0/user/T/browser/Chromium.app",
+            "/private/var/folders/p0/user/C/browser/Chromium.app",
+        ] {
+            assert!(
+                !eligible_browser_install(Path::new(path), None, None, None),
+                "unexpected eligible cache: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn eligibility_excludes_only_precise_chrome_for_testing_metadata_or_name() {
+        let ordinary_path = Path::new("/opt/Browsers/Chromium.app");
+        for (id, name, display) in [
+            (Some("com.google.chrome.for.testing"), None, None),
+            (None, Some("Google Chrome for Testing"), None),
+            (None, None, Some("Google Chrome for Testing")),
+        ] {
+            assert!(!eligible_browser_install(ordinary_path, id, name, display));
+        }
+        assert!(!eligible_browser_install(
+            Path::new("/Applications/Google Chrome for Testing.app"),
+            None,
+            None,
+            None
+        ));
+        assert!(eligible_browser_install(
+            ordinary_path,
+            Some("com.google.chrome.for.testing.custom"),
+            Some("Google Chrome for Testing Custom"),
+            None
+        ));
+    }
+
+    #[test]
+    fn eligibility_preserves_normal_browsers_forks_channels_and_custom_locations() {
+        for (path, id, name) in [
+            ("/Applications/Safari.app", "com.apple.Safari", "Safari"),
+            (
+                "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app",
+                "com.apple.Safari",
+                "Safari",
+            ),
+            (
+                "/Applications/Brave Browser.app",
+                "com.brave.Browser",
+                "Brave Browser",
+            ),
+            (
+                "/Users/milo/Applications/LibreWolf.app",
+                "io.gitlab.librewolf-community",
+                "LibreWolf",
+            ),
+            (
+                "/Applications/Chromium.app",
+                "org.chromium.Chromium",
+                "Chromium",
+            ),
+            (
+                "/Users/milo/Browsers/Firefox Nightly.app",
+                "org.mozilla.nightlyunofficial",
+                "Nightly",
+            ),
+            (
+                "/Volumes/Browser Tools/My Fork.app",
+                "dev.custom.browser",
+                "My Fork",
+            ),
+            (
+                "/opt/browsers/Google Chrome Beta.app",
+                "com.google.Chrome.beta",
+                "Google Chrome Beta",
+            ),
+            (
+                "/Users/milo/.personal-browser/My Fork.app",
+                "dev.custom.browser",
+                "My Fork",
+            ),
+            (
+                "/Applications/Mullvad Browser.app",
+                "net.mullvad.mullvadbrowser",
+                "Mullvad Browser",
+            ),
+        ] {
+            assert!(
+                eligible_browser_install(Path::new(path), Some(id), Some(name), None),
+                "unexpected ineligible installation: {path}"
+            );
+        }
+        for path in [
+            "/Users/milo/.cloakbrowser-custom/Chromium.app",
+            "/Users/milo/.fragrantica-archiver-custom/Chromium.app",
+            "/Users/milo/.cache-custom/Chromium.app",
+            "/Users/milo/Library/Caches-custom/Chromium.app",
+            "/Users/milo/Library/My Caches/Chromium.app",
+            "/Users/milo/ms-playwright-custom/Chromium.app",
+            "/Users/milo/.puppeteer-custom/Chromium.app",
+            "/Users/milo/.agent-browser/personal/Chromium.app",
+            "/Users/milo/.omp/personal/Chromium.app",
+            "/Users/milo/puppeteer/Browsers/Chromium.app",
+            "/Users/milo/Browsers/.local-chromium/Chromium.app",
+            "/tmp-browser/Chromium.app",
+            "/private/var/tmp-browser/Chromium.app",
+            "/private/var/folders/p0/user/Browsers/Chromium.app",
+            "/Applications/Google Chrome for Testing Custom.app",
+        ] {
+            assert!(
+                eligible_browser_install(Path::new(path), None, None, None),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn eligibility_excludes_precise_mozilla_update_staging_shape() {
+        let staging = "/Users/milo/Library/Application Support/MullvadBrowser/UpdateInfo/Applications/Mullvad Browser/updates/0/Updated.app";
+        assert!(!eligible_browser_install(
+            Path::new(staging),
+            None,
+            None,
+            None
+        ));
+        for path in [
+            "/Users/milo/Browsers/Updated.app",
+            "/Users/milo/UpdateInfo/Applications/My Fork/updates/custom/Updated.app",
+            "/Users/milo/UpdateInfo/Applications/My Fork/updates/0/My Fork.app",
+            "/Users/milo/UpdateInfo/Applications/My Fork/updates/0/Updated.app/My Fork.app",
+            "/Users/milo/OtherInfo/Applications/My Fork/updates/0/Updated.app",
+            "/Users/milo/UpdateInfo/Applications/My Fork/releases/0/Updated.app",
+        ] {
+            assert!(
+                eligible_browser_install(Path::new(path), None, None, None),
+                "{path}"
+            );
         }
     }
 
