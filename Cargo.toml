@@ -13,5 +13,5 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "block2"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSDate", "NSDictionary", "NSError", "NSObject", "NSRunLoop", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSDate", "NSDictionary", "NSError", "NSObject", "NSObjCRuntime", "NSRunLoop", "NSString", "NSURL"] }
 block2 = "0.6.2"

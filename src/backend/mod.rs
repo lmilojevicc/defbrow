@@ -1,4 +1,9 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Browser {
@@ -21,5 +26,12 @@ pub trait Backend {
 }
 
 pub fn system_backend() -> Result<Box<dyn Backend>> {
-    bail!("The system browser backend is not implemented yet")
+    #[cfg(target_os = "linux")]
+    return Ok(Box::new(linux::SystemBackend::new()?));
+
+    #[cfg(target_os = "macos")]
+    return Ok(Box::new(macos::SystemBackend::new()?));
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("defbrow supports macOS and Linux only")
 }

@@ -27,6 +27,7 @@ fn key(code: KeyCode) -> KeyEvent {
 fn fuzzy_subsequence_is_case_insensitive_unicode_and_ranked() {
     assert!(ui::fuzzy_score("brv", "Brave").is_some());
     assert!(ui::fuzzy_score("lbrwf", "LibreWolf").is_some());
+    assert!(ui::fuzzy_score("lwf", "LibreWolf").is_some());
     assert!(ui::fuzzy_score("ÜB", "Über Browser").is_some());
     assert!(ui::fuzzy_score("ff", "Firefox").is_some());
     assert!(ui::fuzzy_score("bbb", "Brave").is_none());
