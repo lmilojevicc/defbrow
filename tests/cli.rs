@@ -449,19 +449,25 @@ fn setter_rejection_or_partial_change_never_prints_success() {
 #[cfg(unix)]
 #[test]
 fn native_picker_stays_in_same_process_after_success_or_failure_and_restores_terminal() {
-    for mode in ["success", "reject-once"] {
+    for mode in ["success", "reject-once", "reject-cancel"] {
         let mut session = pty::Session::start(mode);
-        session.wait_for("Search");
+        session.wait_for_all(&["Search", "Beta [current]"]);
         session.send(b"\r");
-        session.wait_for(if mode == "success" {
-            "Default browser: Alpha"
+        session.wait_for_all(if mode == "success" {
+            &["MOCK-SET-1", "Default browser: Alpha", "Alpha [current]"]
         } else {
-            "Could not set Alpha"
+            &["MOCK-SET-1", "Could not set Alpha", "Beta [current]"]
         });
-        // A second Enter must reach a second fake setter within this same session.
-        session.send(b"\r");
-        session.wait_for("Default browser: Alpha");
-        session.send(b"\x1b");
+        if mode != "reject-cancel" {
+            // A second Enter must reach a second fake setter within this same session.
+            session.send(b"\r");
+            session.wait_for_all(&["MOCK-SET-2", "Default browser: Alpha", "Alpha [current]"]);
+        }
+        session.send(if mode == "reject-once" {
+            b"\x03"
+        } else {
+            b"\x1b"
+        });
         session.finish();
     }
 }
@@ -472,13 +478,20 @@ fn native_picker_stays_in_same_process_after_success_or_failure_and_restores_ter
 fn native_picker_fixture() {
     let mode = std::env::var("DEFBROW_TEST_PICKER").expect("PTY fixture requires its test parent");
     let backend = FakeBackend {
-        browsers: vec![browser("a", "Alpha")],
-        fail_once: Cell::new(mode == "reject-once"),
+        browsers: vec![browser("a", "Alpha"), browser("b", "Beta")],
+        current: RefCell::new(CurrentDefaults {
+            http: Some("b".into()),
+            https: Some("b".into()),
+        }),
+        fail_once: Cell::new(mode.starts_with("reject")),
         expect_restored_terminal: true,
         ..Default::default()
     };
     execute(&backend, None, &mut Vec::new(), defbrow::ui::pick).unwrap();
-    assert_eq!(backend.sets.get(), 2);
+    assert_eq!(
+        backend.sets.get(),
+        if mode == "reject-cancel" { 1 } else { 2 }
+    );
     assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     println!("MOCK-SESSION-CANCELLED");
 }

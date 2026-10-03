@@ -109,13 +109,20 @@ impl Session {
     }
 
     pub fn wait_for(&mut self, marker: &str) {
+        self.wait_for_all(&[marker]);
+    }
+
+    pub fn wait_for_all(&mut self, markers: &[&str]) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let marker = marker.split_whitespace().collect::<String>();
-        while !plain_text(&self.output).contains(&marker) {
+        let markers: Vec<_> = markers.iter().map(|marker| plain_text(marker)).collect();
+        while !markers
+            .iter()
+            .all(|marker| plain_text(&self.output).contains(marker))
+        {
             let chunk = self
                 .chunks
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(|_| panic!("Timed out waiting for {marker:?}: {:?}", self.output));
+                .unwrap_or_else(|_| panic!("Timed out waiting for {markers:?}: {:?}", self.output));
             self.output.push_str(&String::from_utf8_lossy(&chunk));
         }
         self.output.clear();
