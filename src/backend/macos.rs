@@ -79,19 +79,6 @@ impl SystemBackend {
         })
         .with_context(|| format!("macOS could not finish setting {scheme}"))
     }
-
-    fn change_error(&self, error: anyhow::Error) -> anyhow::Error {
-        match self.current() {
-            Ok(current) => anyhow!(
-                "{error:#}. Defaults are now HTTP={}, HTTPS={}. Changes are not atomic; a partial change may have occurred.",
-                current.http.as_deref().unwrap_or("(none)"),
-                current.https.as_deref().unwrap_or("(none)")
-            ),
-            Err(read_error) => anyhow!(
-                "{error:#}. Reading the resulting HTTP/HTTPS defaults also failed: {read_error:#}. The actual state is unknown; a partial change may have occurred."
-            ),
-        }
-    }
 }
 
 impl Backend for SystemBackend {
@@ -122,13 +109,11 @@ impl Backend for SystemBackend {
             .context("The selected application is no longer an installed HTTP and HTTPS handler; run defbrow list again")?;
         autoreleasepool(|_| {
             let application = NSURL::fileURLWithPath(&NSString::from_str(&chosen.id));
-            for scheme in ["http", "https"] {
-                if let Err(error) = self.request_scheme(&application, scheme) {
-                    return Err(self.change_error(error));
-                }
-            }
-            let current = self.current().map_err(|error| self.change_error(error))?;
-            verify_defaults(&chosen.id, &current)
+            set_verified_defaults(
+                &chosen.id,
+                || self.current(),
+                |scheme| self.request_scheme(&application, scheme),
+            )
         })
     }
 }
@@ -306,6 +291,53 @@ fn common_browsers(http: Vec<Browser>, https: Vec<Browser>) -> Vec<Browser> {
             .then(a.id.cmp(&b.id))
     });
     browsers
+}
+
+fn set_verified_defaults(
+    id: &str,
+    mut read_current: impl FnMut() -> Result<CurrentDefaults>,
+    mut request_scheme: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let before =
+        read_current().context("Could not read HTTP/HTTPS defaults before changing them")?;
+    if verify_defaults(id, &before).is_ok() {
+        return Ok(());
+    }
+    for scheme in ["http", "https"] {
+        if let Err(error) = request_scheme(scheme) {
+            // A callback error can accompany an achieved goal. Only fresh, exact
+            // per-scheme identities can establish success; never retry a failed request.
+            return reconcile_change(id, Err(error), read_current());
+        }
+    }
+    reconcile_change(id, Ok(()), read_current())
+}
+
+fn reconcile_change(id: &str, request: Result<()>, current: Result<CurrentDefaults>) -> Result<()> {
+    match current {
+        Ok(current) => {
+            let verified = verify_defaults(id, &current);
+            if verified.is_ok() {
+                return Ok(());
+            }
+            match request {
+                Ok(()) => verified,
+                Err(error) => Err(anyhow!(
+                    "{error:#}. Defaults are now HTTP={}, HTTPS={}. Changes are not atomic; a partial change may have occurred.",
+                    current.http.as_deref().unwrap_or("(none)"),
+                    current.https.as_deref().unwrap_or("(none)")
+                )),
+            }
+        }
+        Err(read_error) => {
+            let error = request
+                .err()
+                .unwrap_or_else(|| anyhow!("macOS did not confirm both defaults for {id}"));
+            Err(anyhow!(
+                "{error:#}. Reading the resulting HTTP/HTTPS defaults failed: {read_error:#}. The actual state is unknown; a partial change may have occurred."
+            ))
+        }
+    }
 }
 
 fn verify_defaults(id: &str, current: &CurrentDefaults) -> Result<()> {
@@ -623,6 +655,189 @@ mod tests {
             .to_string();
         assert!(error.contains("HTTP=selected, HTTPS=previous"));
         assert!(verify_defaults("selected", &CurrentDefaults::default()).is_err());
+    }
+
+    fn defaults(http: Option<&str>, https: Option<&str>) -> CurrentDefaults {
+        CurrentDefaults {
+            http: http.map(str::to_owned),
+            https: https.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn callback_error_with_fresh_both_target_readback_succeeds() {
+        for failed_scheme in ["http", "https"] {
+            let target = "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app";
+            let mut reads = [
+                Ok(defaults(Some("previous"), Some("previous"))),
+                Ok(defaults(Some(target), Some(target))),
+            ]
+            .into_iter();
+            let mut requests = Vec::new();
+            set_verified_defaults(
+                target,
+                || reads.next().expect("unexpected extra readback"),
+                |scheme| {
+                    requests.push(scheme.to_owned());
+                    if scheme == failed_scheme {
+                        let completion = Completion::default();
+                        completion.record(Err(
+                            "The file couldn’t be opened. (NSCocoaErrorDomain code 256)".into(),
+                        ));
+                        wait_for_completion(&completion, Duration::ZERO, |_| {
+                            panic!("synthetic callback already complete")
+                        })
+                        .with_context(|| format!("macOS could not finish setting {scheme}"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+            assert!(reads.next().is_none());
+            let expected = if failed_scheme == "http" {
+                vec!["http"]
+            } else {
+                vec!["http", "https"]
+            };
+            assert_eq!(requests, expected);
+        }
+    }
+
+    #[test]
+    fn callback_error_with_mixed_or_absent_readback_remains_error() {
+        for resulting in [
+            defaults(Some("selected"), Some("previous")),
+            defaults(Some("previous"), Some("selected")),
+            defaults(Some("selected"), None),
+            CurrentDefaults::default(),
+        ] {
+            let mut reads = [Ok(CurrentDefaults::default()), Ok(resulting.clone())].into_iter();
+            let mut requests = 0;
+            let error = set_verified_defaults(
+                "selected",
+                || reads.next().unwrap(),
+                |scheme| {
+                    requests += 1;
+                    assert_eq!(scheme, "http");
+                    bail!("synthetic callback failure")
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(requests, 1);
+            assert!(error.contains("synthetic callback failure"));
+            assert!(error.contains(&format!(
+                "HTTP={}, HTTPS={}",
+                resulting.http.as_deref().unwrap_or("(none)"),
+                resulting.https.as_deref().unwrap_or("(none)")
+            )));
+            assert!(error.contains("partial change may have occurred"));
+        }
+    }
+
+    #[test]
+    fn callback_error_with_failed_readback_preserves_unknown_state() {
+        let mut reads = [
+            Ok(CurrentDefaults::default()),
+            Err(anyhow!("synthetic readback failure")),
+        ]
+        .into_iter();
+        let error = set_verified_defaults(
+            "selected",
+            || reads.next().unwrap(),
+            |_| bail!("synthetic callback failure"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("synthetic callback failure"));
+        assert!(error.contains("synthetic readback failure"));
+        assert!(error.contains("actual state is unknown"));
+    }
+
+    #[test]
+    fn successful_requests_with_mismatching_readback_remain_error() {
+        let mut reads = [
+            Ok(CurrentDefaults::default()),
+            Ok(defaults(Some("selected"), Some("previous"))),
+        ]
+        .into_iter();
+        let mut requests = Vec::new();
+        let error = set_verified_defaults(
+            "selected",
+            || reads.next().unwrap(),
+            |scheme| {
+                requests.push(scheme.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(requests, ["http", "https"]);
+        assert!(error.contains("did not confirm both defaults for selected"));
+        assert!(error.contains("HTTP=selected, HTTPS=previous"));
+    }
+
+    #[test]
+    fn successful_requests_with_matching_readback_succeed() {
+        let mut reads = [
+            Ok(CurrentDefaults::default()),
+            Ok(defaults(Some("selected"), Some("selected"))),
+        ]
+        .into_iter();
+        let mut requests = Vec::new();
+        set_verified_defaults(
+            "selected",
+            || reads.next().unwrap(),
+            |scheme| {
+                requests.push(scheme.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(requests, ["http", "https"]);
+        assert!(reads.next().is_none());
+    }
+
+    #[test]
+    fn fresh_existing_target_is_noop_without_requests() {
+        let mut reads = 0;
+        set_verified_defaults(
+            "selected",
+            || {
+                reads += 1;
+                Ok(defaults(Some("selected"), Some("selected")))
+            },
+            |_| panic!("an already-current target must not invoke a setter"),
+        )
+        .unwrap();
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn unreadable_initial_defaults_do_not_start_requests() {
+        let error = set_verified_defaults(
+            "selected",
+            || bail!("synthetic initial read failure"),
+            |_| panic!("unverified initial state must not start a setter"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("synthetic initial read failure"));
+    }
+
+    #[test]
+    fn successful_requests_with_failed_readback_remain_unknown() {
+        let mut reads = [
+            Ok(CurrentDefaults::default()),
+            Err(anyhow!("synthetic readback failure")),
+        ]
+        .into_iter();
+        let error = set_verified_defaults("selected", || reads.next().unwrap(), |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not confirm both defaults for selected"));
+        assert!(error.contains("synthetic readback failure"));
+        assert!(error.contains("actual state is unknown"));
     }
 
     #[test]
