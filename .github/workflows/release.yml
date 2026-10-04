@@ -1,0 +1,232 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tag-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Validate stable version and main ancestry
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 scripts/release.py guard "$RELEASE_TAG")
+          git merge-base --is-ancestor HEAD origin/main
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: guard
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: [guard, checks]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      RELEASE_TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.guard.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Confirm native architecture and test
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$TARGET"
+          python3 scripts/release.py guard "$RELEASE_TAG"
+          cargo test --locked --target "$TARGET"
+      - name: Build and smoke test (no desktop changes)
+        run: |
+          cargo build --release --locked --target "$TARGET"
+          binary="target/$TARGET/release/defbrow"
+          "$binary" --help
+          test "$("$binary" --version)" = "defbrow $VERSION"
+          file "$binary"
+          if [[ "$TARGET" == *linux* ]]; then
+            ldd --version | head -n 1
+            # Keep the documented glibc floor honest even if runner images change.
+            required=$(objdump -T "$binary" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -n 1)
+            test "$(printf '%s\n' "$required" GLIBC_2.39 | sort -V | tail -n 1)" = GLIBC_2.39
+          fi
+      - name: Package binary, documentation and dependency notices
+        run: |
+          cargo metadata --locked --format-version 1 --filter-platform "$TARGET" > "$RUNNER_TEMP/metadata.json"
+          python3 scripts/release.py package "$RELEASE_TAG" "$TARGET" \
+            "target/$TARGET/release/defbrow" "$RUNNER_TEMP/metadata.json" "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [guard, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+      - name: Aggregate complete asset set
+        run: |
+          python3 scripts/release.py manifest "$RELEASE_TAG" "$RUNNER_TEMP/dist"
+          python3 scripts/release.py verify "$RELEASE_TAG" "$RUNNER_TEMP/dist"
+      - name: Create or resume draft, download and verify, then publish
+        run: |
+          # Never overwrite an already published release. Failed drafts can be retried.
+          if gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/release.json"; then
+            test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["isDraft"])' "$RUNNER_TEMP/release.json")" = True
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/dist/"* --clobber
+          mkdir "$RUNNER_TEMP/downloaded"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/downloaded"
+          python3 scripts/release.py verify "$RELEASE_TAG" "$RUNNER_TEMP/downloaded"
+          cmp "$RUNNER_TEMP/dist/SHA256SUMS" "$RUNNER_TEMP/downloaded/SHA256SUMS"
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+
+  homebrew:
+    needs: [guard, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.guard.outputs.version }}
+    steps:
+      - name: Report optional tap credential availability
+        id: credential
+        run: |
+          if [[ -n "$TAP_TOKEN" ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::warning::Release published; Homebrew update pending. Configure a fine-grained HOMEBREW_TAP_GITHUB_TOKEN for lmilojevicc/homebrew-tap Contents write, or follow docs/releasing.md for a manual update.'
+            echo '### Homebrew update pending' >> "$GITHUB_STEP_SUMMARY"
+            echo 'No tap credential is configured. Follow docs/releasing.md; do not advertise brew installation until the formula is committed and tested.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.credential.outputs.available == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: steps.credential.outputs.available == 'true'
+        with:
+          python-version: '3.12'
+      - name: Download published assets and generate formula
+        if: steps.credential.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/published"
+          python3 scripts/release.py formula "$RELEASE_TAG" "$RUNNER_TEMP/published" "$RUNNER_TEMP/defbrow.rb"
+          ruby -c "$RUNNER_TEMP/defbrow.rb"
+      - name: Checkout only the shared tap writer
+        if: steps.credential.outputs.available == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: lmilojevicc/homebrew-tap
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: tap
+      - name: Validate formula on Linux without changing browser defaults
+        if: steps.credential.outputs.available == 'true'
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap lmilojevicc/homebrew-tap "$GITHUB_WORKSPACE/tap"
+          cp "$RUNNER_TEMP/defbrow.rb" "$(brew --repo lmilojevicc/homebrew-tap)/Formula/defbrow.rb"
+          brew style lmilojevicc/homebrew-tap/defbrow
+          brew audit --strict lmilojevicc/homebrew-tap/defbrow
+          brew install lmilojevicc/homebrew-tap/defbrow
+          brew test lmilojevicc/homebrew-tap/defbrow
+      - name: Commit only defbrow formula, retry concurrent tap pushes
+        if: steps.credential.outputs.available == 'true'
+        working-directory: tap
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            # An older release must not downgrade a formula published concurrently.
+            if [[ -f Formula/defbrow.rb ]]; then
+              current=$(sed -n 's/^  version "\([^"]*\)"/\1/p' Formula/defbrow.rb)
+              newest=$(printf '%s\n' "$current" "$VERSION" | sort -V | tail -n 1)
+              if [[ "$newest" != "$VERSION" ]]; then
+                echo '::warning::Tap already has a newer defbrow version; skipping update.'
+                exit 0
+              fi
+            fi
+            cp "$RUNNER_TEMP/defbrow.rb" Formula/defbrow.rb
+            git add -- Formula/defbrow.rb
+            if git diff --cached --quiet -- Formula/defbrow.rb; then exit 0; fi
+            git commit -m "chore: update defbrow to $VERSION" -- Formula/defbrow.rb
+            if git push origin HEAD:main; then
+              echo "Homebrew formula updated to $VERSION and tested on Linux x86_64." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          echo '::error::Release published but tap update failed after three attempts. Follow docs/releasing.md.'
+          exit 1
