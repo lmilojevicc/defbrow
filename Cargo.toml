@@ -3,6 +3,7 @@ name = "defbrow"
 version = "0.1.0"
 edition = "2021"
 description = "A searchable default-browser picker for macOS and Linux"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"
