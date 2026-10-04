@@ -14,6 +14,15 @@
 
 Choose from registered HTTP and HTTPS handlers with a fuzzy-search picker that inherits your terminal colors. Run `defbrow` for the picker, or use `list`, `current`, and `set <id-or-name>`.
 
+## Install with Homebrew
+
+```sh
+brew install lmilojevicc/tap/defbrow
+defbrow --help
+```
+
+Release binaries support macOS 12+ and Linux with glibc 2.39+ on Apple Silicon/ARM64 and Intel/AMD64. On Linux, install `xdg-utils` with your distribution's package manager and run in your graphical desktop session. For older glibc environments, build from source below.
+
 ## Build and install from source
 
 Requires stable Rust; macOS 12+ also needs Apple's Command Line Tools. On Linux, install `xdg-utils` with your distribution's package manager and use your graphical desktop session.

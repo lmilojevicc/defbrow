@@ -156,7 +156,6 @@ def formula(directory, tag):
     return (f'class Defbrow < Formula\n'
             '  desc "Searchable default-browser picker for macOS and Linux"\n'
             '  homepage "https://github.com/lmilojevicc/defbrow"\n'
-            f'  version "{version}"\n'
             '  license "MIT"\n\n'
             '  on_macos do\n'
             '    depends_on macos: :monterey\n'
@@ -186,10 +185,47 @@ def formula(directory, tag):
             'end\n')
 
 
+def tap_update_allowed(path, tag):
+    attempted = version_from_tag(tag)
+    text = path.read_text()
+    urls = re.findall(r'(?m)^\s*url\s+(.+)$', text)
+    if not urls:
+        raise ValueError("existing formula has no pinned release URL")
+    versions = set()
+    for url in urls:
+        match = re.fullmatch(
+            r'"https://github\.com/lmilojevicc/defbrow/releases/download/(v[^/]+)/'
+            r'defbrow_([^/]+)_(darwin|linux)_(arm64|amd64)\.tar\.gz"', url)
+        if not match:
+            raise ValueError("existing formula has an unparseable release URL")
+        try:
+            version = version_from_tag(match[1])
+        except ValueError as error:
+            raise ValueError("existing formula has a non-stable release version") from error
+        if version != match[2]:
+            raise ValueError("existing formula release tag and archive versions disagree")
+        versions.add(version)
+    for explicit in re.findall(r'(?m)^\s*version\s+(.+)$', text):
+        match = re.fullmatch(r'"([0-9]+\.[0-9]+\.[0-9]+)"', explicit)
+        if not match:
+            raise ValueError("existing formula has an unparseable explicit version")
+        try:
+            versions.add(version_from_tag("v" + match[1]))
+        except ValueError as error:
+            raise ValueError("existing formula has a non-stable explicit version") from error
+    if len(versions) != 1:
+        raise ValueError("existing formula versions disagree")
+    current = versions.pop()
+    return tuple(map(int, current.split("."))) <= tuple(map(int, attempted.split(".")))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("guard").add_argument("tag")
+    tap_update = sub.add_parser("tap-update-allowed")
+    tap_update.add_argument("tag")
+    tap_update.add_argument("formula", type=Path)
     pack = sub.add_parser("package")
     pack.add_argument("tag")
     pack.add_argument("target", choices=TARGETS)
@@ -206,6 +242,8 @@ def main():
     try:
         if args.command == "guard":
             print(guard(args.tag))
+        elif args.command == "tap-update-allowed":
+            print(str(tap_update_allowed(args.formula, args.tag)).lower())
         elif args.command == "package":
             print(package(args.tag, args.target, args.binary, args.metadata, args.output))
         elif args.command == "manifest":
