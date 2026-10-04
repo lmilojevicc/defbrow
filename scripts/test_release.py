@@ -86,6 +86,63 @@ class ReleaseTests(unittest.TestCase):
         result = subprocess.run(["ruby", "-c", str(ruby)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_formula_infers_version_from_release_url(self):
+        self.make_assets()
+        release.manifest(self.assets, self.tag)
+        formula = release.formula(self.assets, self.tag)
+        self.assertNotRegex(formula, r'(?m)^\s*version\s+"')
+        self.assertIn(f"/releases/download/{self.tag}/defbrow_{self.version}_", formula)
+        self.assertIn('assert_equal "defbrow #{version}", '
+                      'shell_output("#{bin}/defbrow --version").strip', formula)
+
+    def test_tap_update_rejects_newer_url_inferred_formula(self):
+        self.make_assets()
+        release.manifest(self.assets, self.tag)
+        formula = release.formula(self.assets, self.tag).replace("0.1.0", "0.10.0")
+        self.assertNotRegex(formula, r'(?m)^\s*version\s+"')
+        path = self.root / "defbrow.rb"
+        path.write_text(formula)
+        self.assertFalse(release.tap_update_allowed(path, "v0.9.0"))
+        self.assertTrue(release.tap_update_allowed(path, "v0.10.0"))
+        self.assertTrue(release.tap_update_allowed(path, "v1.0.0"))
+        result = subprocess.run(
+            ["python3", "-B", str(release.ROOT / "scripts/release.py"),
+             "tap-update-allowed", "v0.9.0", str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "false")
+
+    def test_tap_update_supports_matching_explicit_version(self):
+        self.make_assets()
+        release.manifest(self.assets, self.tag)
+        path = self.root / "defbrow.rb"
+        formula = release.formula(self.assets, self.tag)
+        path.write_text('version "0.1.0"\n' + formula)
+        self.assertTrue(release.tap_update_allowed(path, self.tag))
+        path.write_text('version "0.2.0"\n' + formula)
+        with self.assertRaisesRegex(ValueError, "existing formula"):
+            release.tap_update_allowed(path, self.tag)
+
+    def test_tap_update_fails_visibly_on_unparseable_existing_version(self):
+        self.make_assets()
+        release.manifest(self.assets, self.tag)
+        formula = release.formula(self.assets, self.tag)
+        path = self.root / "defbrow.rb"
+        for invalid in ["class Defbrow < Formula\nend\n", 'version "0.1.0"\n',
+                        formula.replace("v0.1.0/", "latest/"),
+                        formula.replace("defbrow_0.1.0_", "defbrow_0.2.0_"),
+                        formula.replace("0.1.0", "0.1.0-rc.1"),
+                        formula.replace("darwin_arm64.tar.gz", "unknown.tar.gz"),
+                        formula.replace("v0.1.0/", "v0.2.0/", 1)]:
+            path.write_text(invalid)
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "existing formula"):
+                release.tap_update_allowed(path, self.tag)
+        result = subprocess.run(
+            ["python3", "-B", str(release.ROOT / "scripts/release.py"),
+             "tap-update-allowed", self.tag, str(path)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release: existing formula", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_missing_or_extra_asset_rejected(self):
         self.make_assets()
         name = release.archive_names(self.version)[0]

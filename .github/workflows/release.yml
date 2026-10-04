@@ -212,9 +212,8 @@ jobs:
             git reset --hard origin/main
             # An older release must not downgrade a formula published concurrently.
             if [[ -f Formula/defbrow.rb ]]; then
-              current=$(sed -n 's/^  version "\([^"]*\)"/\1/p' Formula/defbrow.rb)
-              newest=$(printf '%s\n' "$current" "$VERSION" | sort -V | tail -n 1)
-              if [[ "$newest" != "$VERSION" ]]; then
+              update_allowed=$(python3 "$GITHUB_WORKSPACE/scripts/release.py" tap-update-allowed "$RELEASE_TAG" Formula/defbrow.rb)
+              if [[ "$update_allowed" == false ]]; then
                 echo '::warning::Tap already has a newer defbrow version; skipping update.'
                 exit 0
               fi
