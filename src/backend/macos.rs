@@ -1,6 +1,6 @@
 //! Registered HTTP/HTTPS handlers through NSWorkspace (macOS 12 and later).
 
-use super::{Backend, Browser, CurrentDefaults};
+use super::{Backend, Browser, Cancelled, CurrentDefaults};
 use anyhow::{anyhow, bail, Context, Result};
 use block2::RcBlock;
 use objc2::{available, rc::autoreleasepool, MainThreadMarker, Message};
@@ -54,7 +54,12 @@ impl SystemBackend {
             .with_context(|| format!("Could not resolve the current {scheme} application"))
     }
 
-    fn request_scheme(&self, application: &NSURL, scheme: &str) -> Result<()> {
+    fn request_scheme(
+        &self,
+        application: &NSURL,
+        scheme: &str,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let scheme_string = NSString::from_str(scheme);
         let completion = Completion::default();
         let callback = completion_block(&completion, application, &scheme_string);
@@ -65,7 +70,7 @@ impl SystemBackend {
                 Some(&callback),
             );
         let run_loop = NSRunLoop::mainRunLoop();
-        wait_for_completion(&completion, CONFIRMATION_TIMEOUT, |slice| {
+        wait_for_completion(&completion, CONFIRMATION_TIMEOUT, interrupted, |slice| {
             autoreleasepool(|_| {
                 let until = NSDate::dateWithTimeIntervalSinceNow(slice.as_secs_f64());
                 // SAFETY: Foundation's exported immutable run-loop mode is valid on macOS.
@@ -100,7 +105,7 @@ impl Backend for SystemBackend {
         })
     }
 
-    fn set_default(&self, browser: &Browser) -> Result<()> {
+    fn set_default(&self, browser: &Browser, interrupted: &dyn Fn() -> bool) -> Result<()> {
         // Re-discover instead of trusting a stale picker entry or caller-supplied path.
         let installed = self.browsers()?;
         let chosen = installed
@@ -111,8 +116,9 @@ impl Backend for SystemBackend {
             let application = NSURL::fileURLWithPath(&NSString::from_str(&chosen.id));
             set_verified_defaults(
                 &chosen.id,
+                interrupted,
                 || self.current(),
-                |scheme| self.request_scheme(&application, scheme),
+                |scheme| self.request_scheme(&application, scheme, interrupted),
             )
         })
     }
@@ -295,6 +301,7 @@ fn common_browsers(http: Vec<Browser>, https: Vec<Browser>) -> Vec<Browser> {
 
 fn set_verified_defaults(
     id: &str,
+    interrupted: &dyn Fn() -> bool,
     mut read_current: impl FnMut() -> Result<CurrentDefaults>,
     mut request_scheme: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
@@ -303,8 +310,22 @@ fn set_verified_defaults(
     if verify_defaults(id, &before).is_ok() {
         return Ok(());
     }
+    // Tracks whether a scheme request has reached the OS in this attempt.
+    let mut requested = false;
     for scheme in ["http", "https"] {
+        // Stop before asking for another scheme once the wait has been interrupted.
+        if interrupted() {
+            return Err(Cancelled { requested }.into());
+        }
+        // This request is about to reach the OS, so any later cancellation — including
+        // one before the next scheme — must report that a change may be pending.
+        requested = true;
         if let Err(error) = request_scheme(scheme) {
+            if error.is::<Cancelled>() {
+                // A cancelled wait must not claim success or start another request:
+                // the pending OS request may still apply to either scheme later.
+                return Err(error);
+            }
             // A callback error can accompany an achieved goal. Only fresh, exact
             // per-scheme identities can establish success; never retry a failed request.
             return reconcile_change(id, Err(error), read_current());
@@ -402,12 +423,18 @@ fn completion_block(
 fn wait_for_completion(
     completion: &Completion,
     timeout: Duration,
+    interrupted: &dyn Fn() -> bool,
     mut service_run_loop: impl FnMut(Duration),
 ) -> Result<()> {
     let started = Instant::now();
     loop {
         if let Some(result) = completion.result() {
             return result.map_err(anyhow::Error::msg);
+        }
+        if interrupted() {
+            // The request is already with the OS: stopping the wait cannot cancel it,
+            // which may still apply.
+            return Err(Cancelled { requested: true }.into());
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -676,6 +703,7 @@ mod tests {
             let mut requests = Vec::new();
             set_verified_defaults(
                 target,
+                &|| false,
                 || reads.next().expect("unexpected extra readback"),
                 |scheme| {
                     requests.push(scheme.to_owned());
@@ -684,7 +712,7 @@ mod tests {
                         completion.record(Err(
                             "The file couldn’t be opened. (NSCocoaErrorDomain code 256)".into(),
                         ));
-                        wait_for_completion(&completion, Duration::ZERO, |_| {
+                        wait_for_completion(&completion, Duration::ZERO, &|| false, |_| {
                             panic!("synthetic callback already complete")
                         })
                         .with_context(|| format!("macOS could not finish setting {scheme}"))
@@ -716,6 +744,7 @@ mod tests {
             let mut requests = 0;
             let error = set_verified_defaults(
                 "selected",
+                &|| false,
                 || reads.next().unwrap(),
                 |scheme| {
                     requests += 1;
@@ -745,6 +774,7 @@ mod tests {
         .into_iter();
         let error = set_verified_defaults(
             "selected",
+            &|| false,
             || reads.next().unwrap(),
             |_| bail!("synthetic callback failure"),
         )
@@ -765,6 +795,7 @@ mod tests {
         let mut requests = Vec::new();
         let error = set_verified_defaults(
             "selected",
+            &|| false,
             || reads.next().unwrap(),
             |scheme| {
                 requests.push(scheme.to_owned());
@@ -788,6 +819,7 @@ mod tests {
         let mut requests = Vec::new();
         set_verified_defaults(
             "selected",
+            &|| false,
             || reads.next().unwrap(),
             |scheme| {
                 requests.push(scheme.to_owned());
@@ -804,6 +836,7 @@ mod tests {
         let mut reads = 0;
         set_verified_defaults(
             "selected",
+            &|| false,
             || {
                 reads += 1;
                 Ok(defaults(Some("selected"), Some("selected")))
@@ -818,6 +851,7 @@ mod tests {
     fn unreadable_initial_defaults_do_not_start_requests() {
         let error = set_verified_defaults(
             "selected",
+            &|| false,
             || bail!("synthetic initial read failure"),
             |_| panic!("unverified initial state must not start a setter"),
         )
@@ -832,9 +866,10 @@ mod tests {
             Err(anyhow!("synthetic readback failure")),
         ]
         .into_iter();
-        let error = set_verified_defaults("selected", || reads.next().unwrap(), |_| Ok(()))
-            .unwrap_err()
-            .to_string();
+        let error =
+            set_verified_defaults("selected", &|| false, || reads.next().unwrap(), |_| Ok(()))
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("did not confirm both defaults for selected"));
         assert!(error.contains("synthetic readback failure"));
         assert!(error.contains("actual state is unknown"));
@@ -843,7 +878,7 @@ mod tests {
     #[test]
     fn completion_wait_services_callbacks_and_keeps_first_result() {
         let completion = Completion::default();
-        wait_for_completion(&completion, Duration::from_secs(1), |_| {
+        wait_for_completion(&completion, Duration::from_secs(1), &|| false, |_| {
             completion.record(Ok(()))
         })
         .unwrap();
@@ -855,9 +890,10 @@ mod tests {
     fn callback_errors_are_preserved() {
         let completion = Completion::default();
         completion.record(Err("user rejected the request".into()));
-        let error =
-            wait_for_completion(&completion, Duration::ZERO, |_| panic!("already complete"))
-                .unwrap_err();
+        let error = wait_for_completion(&completion, Duration::ZERO, &|| false, |_| {
+            panic!("already complete")
+        })
+        .unwrap_err();
         assert_eq!(error.to_string(), "user rejected the request");
     }
 
@@ -865,8 +901,10 @@ mod tests {
     fn timeout_does_not_invalidate_late_callback_state() {
         let completion = Completion::default();
         let late = completion.clone();
-        let error =
-            wait_for_completion(&completion, Duration::ZERO, |_| panic!("timeout")).unwrap_err();
+        let error = wait_for_completion(&completion, Duration::ZERO, &|| false, |_| {
+            panic!("timeout")
+        })
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("may still change the default later"));
@@ -874,6 +912,91 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(completion.result(), Some(Ok(())));
+    }
+
+    #[test]
+    fn interruption_stops_the_wait_without_claiming_a_result() {
+        let completion = Completion::default();
+        let error = wait_for_completion(&completion, Duration::from_secs(30), &|| true, |_| {
+            panic!("an interrupted wait must not service the run loop")
+        })
+        .unwrap_err();
+        assert!(error.is::<Cancelled>());
+        assert_eq!(error.to_string(), "stopped waiting for OS approval");
+        // The wait only starts after the request reached the OS.
+        assert!(error.downcast_ref::<Cancelled>().unwrap().requested);
+        assert_eq!(completion.result(), None);
+    }
+
+    #[test]
+    fn interruption_during_a_scheme_request_issues_no_further_request() {
+        let mut reads = [Ok(CurrentDefaults::default())].into_iter();
+        let mut requests = Vec::new();
+        let error = set_verified_defaults(
+            "selected",
+            &|| false,
+            || reads.next().expect("unexpected extra readback"),
+            |scheme| {
+                requests.push(scheme.to_owned());
+                // Context must not hide cancellation from the caller.
+                Err(Cancelled { requested: true })
+                    .context(format!("macOS could not finish setting {scheme}"))
+            },
+        )
+        .unwrap_err();
+        let cancelled = error.downcast_ref::<Cancelled>().unwrap();
+        assert!(cancelled.requested);
+        assert_eq!(requests, ["http"]);
+        assert!(reads.next().is_none());
+    }
+
+    #[test]
+    fn interruption_after_a_successful_http_request_reports_a_pending_change() {
+        let target = "/Applications/Alpha.app";
+        let mut reads = [
+            // Both schemes still point at the previous browser, so both are attempted.
+            Ok(defaults(Some("previous"), Some("previous"))),
+            // A post-check would see the HTTP half applied once it runs.
+            Ok(defaults(Some(target), Some("previous"))),
+        ]
+        .into_iter();
+        // The hook is polled only before each scheme: the first poll passes, the
+        // second one stops the attempt after HTTP succeeded.
+        let polls = std::cell::Cell::new(0);
+        let mut requests = Vec::new();
+        let error = set_verified_defaults(
+            target,
+            &|| {
+                polls.set(polls.get() + 1);
+                polls.get() > 1
+            },
+            || reads.next().expect("unexpected extra readback"),
+            |scheme| {
+                requests.push(scheme.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        // The HTTP request already reached the OS, so stopping before HTTPS must
+        // report a possibly pending change rather than "nothing was requested".
+        let cancelled = error.downcast_ref::<Cancelled>().unwrap();
+        assert!(cancelled.requested);
+        assert_eq!(requests, ["http"]);
+    }
+
+    #[test]
+    fn interruption_before_a_request_prevents_it() {
+        let mut reads = [Ok(CurrentDefaults::default())].into_iter();
+        let error = set_verified_defaults(
+            "selected",
+            &|| true,
+            || reads.next().expect("unexpected extra readback"),
+            |_| panic!("an interrupted wait must not issue a request"),
+        )
+        .unwrap_err();
+        // Nothing reached the OS, so no prompt was shown and no change is pending.
+        let cancelled = error.downcast_ref::<Cancelled>().unwrap();
+        assert!(!cancelled.requested);
     }
 
     #[test]

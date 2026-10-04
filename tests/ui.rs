@@ -110,6 +110,15 @@ fn unicode_backspace_clear_cancel_and_key_releases() {
     release.kind = KeyEventKind::Release;
     picker.handle_key(release, true);
     assert_eq!(picker.query(), "");
+    assert!(ui::is_cancel_key(&key(KeyCode::Esc)));
+    assert!(ui::is_cancel_key(&KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL
+    )));
+    assert!(!ui::is_cancel_key(&key(KeyCode::Char('c'))));
+    let mut released_escape = key(KeyCode::Esc);
+    released_escape.kind = KeyEventKind::Release;
+    assert!(!ui::is_cancel_key(&released_escape));
     assert_eq!(
         picker.handle_key(key(KeyCode::Esc), true),
         PickerAction::Cancel

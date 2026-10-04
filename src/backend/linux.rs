@@ -56,7 +56,9 @@ impl Backend for SystemBackend {
         }
     }
 
-    fn set_default(&self, browser: &Browser) -> Result<()> {
+    fn set_default(&self, browser: &Browser, _interrupted: &dyn Fn() -> bool) -> Result<()> {
+        // xdg-settings returns promptly and has no OS consent dialog to wait for,
+        // so there is nothing to interrupt here.
         if !self
             .browsers()?
             .iter()
@@ -981,7 +983,7 @@ mod tests {
             ),
         );
         backend
-            .set_default(&backend.browsers().unwrap()[0])
+            .set_default(&backend.browsers().unwrap()[0], &|| false)
             .unwrap();
         assert!(script.borrow().is_empty());
     }
@@ -994,7 +996,7 @@ mod tests {
         let browser = backend.browsers().unwrap().remove(0);
         fs::remove_file(path).unwrap();
         assert!(backend
-            .set_default(&browser)
+            .set_default(&browser, &|| false)
             .unwrap_err()
             .to_string()
             .contains("no longer an available"));
@@ -1016,7 +1018,7 @@ mod tests {
             ),
         );
         let error = backend
-            .set_default(&backend.browsers().unwrap()[0])
+            .set_default(&backend.browsers().unwrap()[0], &|| false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("check failed"));
@@ -1039,7 +1041,7 @@ mod tests {
             ),
         );
         let error = backend
-            .set_default(&backend.browsers().unwrap()[0])
+            .set_default(&backend.browsers().unwrap()[0], &|| false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("set failed"));
@@ -1063,7 +1065,7 @@ mod tests {
             ),
         );
         let error = backend
-            .set_default(&backend.browsers().unwrap()[0])
+            .set_default(&backend.browsers().unwrap()[0], &|| false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("HTTP=unavailable"));
@@ -1087,7 +1089,7 @@ mod tests {
             ),
         );
         let error = backend
-            .set_default(&backend.browsers().unwrap()[0])
+            .set_default(&backend.browsers().unwrap()[0], &|| false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("session refused"));
@@ -1111,7 +1113,7 @@ mod tests {
             ),
         );
         let error = backend
-            .set_default(&backend.browsers().unwrap()[0])
+            .set_default(&backend.browsers().unwrap()[0], &|| false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("did not both match"));
@@ -1134,7 +1136,7 @@ mod tests {
             ),
         );
         let error = backend
-            .set_default(&backend.browsers().unwrap()[0])
+            .set_default(&backend.browsers().unwrap()[0], &|| false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("install xdg-utils"));

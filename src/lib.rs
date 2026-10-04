@@ -1,11 +1,12 @@
 pub mod backend;
 pub mod ui;
 
-use std::io::Write;
+use std::{io::Write, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use backend::{Backend, Browser, CurrentDefaults};
+use backend::{Backend, Browser, Cancelled, CurrentDefaults};
 use clap::{Parser, Subcommand};
+use crossterm::event::{self, Event};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -50,7 +51,8 @@ pub fn resolve_browser<'a>(browsers: &'a [Browser], query: &str) -> Result<&'a B
     Ok(browser)
 }
 
-// The session suspends its terminal before invoking the switch callback.
+// The session keeps its terminal for the whole picker run, so the switch callback
+// is invoked with the picker screen and raw mode still active.
 pub fn execute(
     backend: &dyn Backend,
     command: Option<&Command>,
@@ -96,25 +98,47 @@ pub fn execute(
 }
 
 fn switch_interactively(backend: &dyn Backend, picker: &mut ui::Picker, browser: &Browser) {
-    let set_result = backend.set_default(browser);
+    let set_result = backend.set_default(browser, &cancel_requested);
     // Read actual state even after rejection: native setters can make partial changes.
     let current_result = backend.current();
     let browsers_result = backend.browsers();
-    let mut status = match &set_result {
-        Err(error) => format!("Could not set {}: {error:#}", browser.name),
-        Ok(()) => match &current_result {
-            Ok(current)
-                if current.http.as_deref() == Some(&browser.id)
-                    && current.https.as_deref() == Some(&browser.id) =>
-            {
-                format!("Default browser: {}", browser.name)
-            }
-            Ok(_) => format!(
-                "Change to {} not verified; defaults differ. A partial change may have occurred.",
-                browser.name
+    let cancelled = set_result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<Cancelled>());
+    let mut status = if let Some(cancelled) = cancelled {
+        // A cancelled attempt reports the readback: the pending OS request may still apply.
+        let stopped = if cancelled.requested {
+            "Stopped waiting for approval."
+        } else {
+            // Nothing reached the OS, so no wait or prompt happened.
+            "Stopped before requesting a change."
+        };
+        match &current_result {
+            Ok(current) => format!(
+                "{stopped} HTTP: {}; HTTPS: {}",
+                current.http.as_deref().unwrap_or("(none)"),
+                current.https.as_deref().unwrap_or("(none)")
             ),
-            Err(_) => format!("Change to {} requested, but not verified.", browser.name),
-        },
+            Err(_) => stopped.to_owned(),
+        }
+    } else {
+        match &set_result {
+            Err(error) => format!("Could not set {}: {error:#}", browser.name),
+            Ok(()) => match &current_result {
+                Ok(current)
+                    if current.http.as_deref() == Some(&browser.id)
+                        && current.https.as_deref() == Some(&browser.id) =>
+                {
+                    format!("Default browser: {}", browser.name)
+                }
+                Ok(_) => format!(
+                    "Change to {} not verified; defaults differ. A partial change may have occurred.",
+                    browser.name
+                ),
+                Err(_) => format!("Change to {} requested, but not verified.", browser.name),
+            },
+        }
     };
     if let Err(error) = &current_result {
         status.push_str(&format!(
@@ -131,6 +155,19 @@ fn switch_interactively(backend: &dyn Backend, picker: &mut ui::Picker, browser:
     picker.set_status(status);
 }
 
+/// Reports whether Esc or Ctrl-C was pressed while a setter is waiting for OS
+/// approval. Only cancel keys are consumed; any other key pressed during the wait
+/// is discarded, and poll/read errors leave the wait running.
+fn cancel_requested() -> bool {
+    if !matches!(event::poll(Duration::ZERO), Ok(true)) {
+        return false;
+    }
+    match event::read() {
+        Ok(Event::Key(key)) => ui::is_cancel_key(&key),
+        _ => false,
+    }
+}
+
 fn set_browser(backend: &dyn Backend, browser: &Browser, output: &mut dyn Write) -> Result<()> {
     writeln!(
         output,
@@ -138,7 +175,8 @@ fn set_browser(backend: &dyn Backend, browser: &Browser, output: &mut dyn Write)
         display_text(&browser.name)
     )?;
     output.flush()?;
-    backend.set_default(browser)?;
+    // No picker input to observe here: this path has no interactive wait to stop.
+    backend.set_default(browser, &|| false)?;
     let current = backend
         .current()
         .context("Change requested, but reading defaults for verification failed")?;

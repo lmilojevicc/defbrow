@@ -5,7 +5,7 @@ use crossterm::{
     cursor::Show,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, LeaveAlternateScreen},
 };
 use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
@@ -36,6 +36,15 @@ pub fn fuzzy_score(query: &str, text: &str) -> Option<(usize, usize)> {
         cursor += offset + 1;
     }
     Some((cursor - query.len(), text.len()))
+}
+
+/// Esc or Ctrl-C cancels wherever it is handled: the picker loop and an in-flight
+/// setter wait share this test. Key releases never cancel.
+pub fn is_cancel_key(key: &KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release
+        && (key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c' | 'C'))))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -132,10 +141,7 @@ impl Picker {
         if key.kind == KeyEventKind::Release {
             return PickerAction::Continue;
         }
-        if key.code == KeyCode::Esc
-            || (key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('c' | 'C')))
-        {
+        if is_cancel_key(&key) {
             return PickerAction::Cancel;
         }
         match key.code {
@@ -338,7 +344,7 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn restore(&mut self) -> Result<()> {
-        // Attempt both restorations even if one fails; a setter must not run on failure.
+        // Attempt both restorations even if one fails, so neither failure hides the other.
         let raw = disable_raw_mode();
         let screen = execute!(io::stdout(), LeaveAlternateScreen, Show);
         raw.context("Failed to leave terminal raw mode")?;
@@ -356,7 +362,17 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Switch callbacks run only with the terminal restored, so native OS prompts can work.
+/// Shown while a setter waits for OS approval; platform-specific because only macOS
+/// asks the user to confirm. Plain ASCII: the render path sanitizes control characters
+/// and clips to width.
+#[cfg(target_os = "macos")]
+pub const WAITING_STATUS: &str = "Waiting for macOS to confirm the new default browser...";
+
+#[cfg(not(target_os = "macos"))]
+pub const WAITING_STATUS: &str = "Waiting for OS confirmation...";
+
+/// Switch callbacks run with the picker screen and raw mode still active, so an OS
+/// prompt appears over the picker and no alternate-screen flicker occurs.
 pub fn pick(mut picker: Picker, switch: &mut dyn FnMut(&mut Picker, &Browser)) -> Result<()> {
     if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
         bail!("The picker needs a terminal. Use `defbrow list` or `defbrow set <id>` instead.");
@@ -374,18 +390,13 @@ pub fn pick(mut picker: Picker, switch: &mut dyn FnMut(&mut Picker, &Browser)) -
                 PickerAction::Continue => {}
                 PickerAction::Cancel => break,
                 PickerAction::Select(browser) => {
-                    match guard.restore() {
-                        Ok(()) => switch(&mut picker, &browser),
-                        Err(error) => picker.set_status(format!(
-                            "No change requested: terminal suspension failed: {error:#}"
-                        )),
-                    }
-                    // Keep the model and scroll state; clear invalidated screen buffers.
-                    guard.active = true;
-                    enable_raw_mode().context("Failed to resume terminal raw mode")?;
-                    execute!(io::stdout(), EnterAlternateScreen)
-                        .context("Failed to resume terminal screen")?;
-                    terminal.clear()?;
+                    // Draw the wait before the setter blocks, so the status is on
+                    // screen for the whole wait, including an OS consent dialog.
+                    picker.set_status(WAITING_STATUS);
+                    terminal.draw(|frame| {
+                        render(frame, &picker, &mut state, no_color);
+                    })?;
+                    switch(&mut picker, &browser);
                 }
             }
         }

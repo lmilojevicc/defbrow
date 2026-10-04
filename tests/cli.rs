@@ -1,6 +1,8 @@
 use std::{
     cell::{Cell, RefCell},
+    path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -11,7 +13,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use defbrow::{
-    backend::{Backend, Browser, CurrentDefaults},
+    backend::{Backend, Browser, Cancelled, CurrentDefaults},
     execute, resolve_browser,
     ui::{Picker, PickerAction},
     Cli, Command,
@@ -36,7 +38,13 @@ struct FakeBackend {
     readback_fails: bool,
     refresh_fails: bool,
     refreshed_browsers: Option<Vec<Browser>>,
-    expect_restored_terminal: bool,
+    /// The PTY fixture requires the picker's screen to stay active for the setter.
+    expect_picker_screen: bool,
+    /// When set, the setter blocks like a native setter awaiting OS approval.
+    block_until_released: Option<PathBuf>,
+    /// When set, the setter reports a stopped wait instead of changing anything,
+    /// carrying the given `Cancelled::requested` value.
+    cancel: Option<bool>,
 }
 
 impl Backend for FakeBackend {
@@ -59,12 +67,28 @@ impl Backend for FakeBackend {
         }
         Ok(self.current.borrow().clone())
     }
-    fn set_default(&self, browser: &Browser) -> Result<()> {
-        if self.expect_restored_terminal {
-            assert!(!crossterm::terminal::is_raw_mode_enabled()?);
-            println!("MOCK-SET-{}", self.sets.get() + 1);
-        }
+    fn set_default(&self, browser: &Browser, interrupted: &dyn Fn() -> bool) -> Result<()> {
         self.sets.set(self.sets.get() + 1);
+        let blocked_until = self.block_until_released.as_deref();
+        if blocked_until.is_some() {
+            // Announced before the checks below, so a test can wait for the setter to be
+            // entered even once the picker screen is no longer active.
+            println!("MOCK-SET-BLOCKED");
+        }
+        if self.expect_picker_screen {
+            // ui::pick keeps the picker's screen: raw mode stays enabled here, and the
+            // PTY tests assert no alternate-screen leave escape reaches the terminal.
+            assert!(crossterm::terminal::is_raw_mode_enabled()?);
+        }
+        if let Some(path) = blocked_until {
+            block_until_released(path, interrupted)?;
+        }
+        if let Some(requested) = self.cancel {
+            return Err(Cancelled { requested }.into());
+        }
+        if self.expect_picker_screen {
+            println!("MOCK-SET-{}", self.sets.get());
+        }
         if self.fail || self.fail_once.replace(false) {
             bail!("Fixture rejection: HTTP=old, HTTPS=old");
         }
@@ -74,6 +98,26 @@ impl Backend for FakeBackend {
         }
         Ok(())
     }
+}
+
+/// Stands in for a native setter that blocks on an OS consent dialog: bounded, and
+/// stopped by the same interruption hook the real backends poll. Reaching this wait
+/// means the request was already issued, so the cancellation reports `requested`.
+fn block_until_released(path: &Path, interrupted: &dyn Fn() -> bool) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        if interrupted() {
+            // Printed from inside the setter, so the cancellation test can assert that
+            // the interruption hook stopped it instead of the fixture timing out.
+            println!("MOCK-SET-CANCELLED");
+            return Err(Cancelled { requested: true }.into());
+        }
+        if Instant::now() >= deadline {
+            bail!("Fixture release file was never created: {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 fn no_picker(_: Picker, _: &mut dyn FnMut(&mut Picker, &Browser)) -> Result<()> {
@@ -365,6 +409,42 @@ fn interactive_refresh_preserves_filter_and_selected_identity_with_new_entries()
 }
 
 #[test]
+fn cancelled_attempt_reports_the_readback_without_claiming_a_wait_that_did_not_happen() {
+    for (requested, expected) in [
+        (true, "Stopped waiting for approval. HTTP: b; HTTPS: b"),
+        (
+            false,
+            "Stopped before requesting a change. HTTP: b; HTTPS: b",
+        ),
+    ] {
+        let backend = FakeBackend {
+            browsers: vec![browser("a", "Alpha"), browser("b", "Beta")],
+            current: RefCell::new(CurrentDefaults {
+                http: Some("b".into()),
+                https: Some("b".into()),
+            }),
+            cancel: Some(requested),
+            ..Default::default()
+        };
+        execute(&backend, None, &mut Vec::new(), |mut picker, switch| {
+            let browser = choose(&mut picker);
+            switch(&mut picker, &browser);
+            assert_eq!(picker.status(), expected);
+            // A stopped attempt claims neither success nor a verified change.
+            assert!(!picker.status().starts_with("Default browser:"));
+            assert!(rendered(&picker).contains("Beta [current]"));
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
+                PickerAction::Cancel
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(backend.sets.get(), 1);
+    }
+}
+
+#[test]
 fn unknown_ambiguous_and_picker_errors_do_not_set() {
     let backend = FakeBackend {
         browsers: vec![browser("a", "Shared"), browser("b", "Shared")],
@@ -453,16 +533,30 @@ fn native_picker_stays_in_same_process_after_success_or_failure_and_restores_ter
         let mut session = pty::Session::start(mode);
         session.wait_for_all(&["Search", "Beta [current]"]);
         session.send(b"\r");
+        // The retained picker screen makes ratatui redraw only changed cells, so the
+        // wait and the result status are matched instead of unchanged list markers.
         session.wait_for_all(if mode == "success" {
-            &["MOCK-SET-1", "Default browser: Alpha", "Alpha [current]"]
+            &[
+                "MOCK-SET-1",
+                defbrow::ui::WAITING_STATUS,
+                "Default browser: Alpha",
+            ]
         } else {
-            &["MOCK-SET-1", "Could not set Alpha", "Beta [current]"]
+            &[
+                "MOCK-SET-1",
+                defbrow::ui::WAITING_STATUS,
+                "Could not set Alpha",
+            ]
         });
         if mode != "reject-cancel" {
             // A second Enter must reach a second fake setter within this same session.
             session.send(b"\r");
-            session.wait_for_all(&["MOCK-SET-2", "Default browser: Alpha", "Alpha [current]"]);
+            session.wait_for_all(&["MOCK-SET-2", "Default browser: Alpha"]);
         }
+        assert!(
+            !session.raw_output().contains("\u{1b}[?1049l"),
+            "the setter must not leave the alternate screen"
+        );
         session.send(if mode == "reject-once" {
             b"\x03"
         } else {
@@ -470,6 +564,66 @@ fn native_picker_stays_in_same_process_after_success_or_failure_and_restores_ter
         });
         session.finish();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_picker_keeps_its_screen_while_the_setter_waits_for_approval() {
+    let mut session = pty::Session::start_blocked("block-success");
+    session.wait_for_all(&["Search", "Alpha", "Beta [current]"]);
+    session.send(b"\r");
+    session.wait_for_all(&[defbrow::ui::WAITING_STATUS, "MOCK-SET-BLOCKED"]);
+    // The wait is on screen while the setter blocks. ratatui redraws only changed
+    // cells, so the picker screen drawn earlier is matched on the complete raw
+    // transcript instead of the latest output window.
+    let raw = session.raw_output();
+    assert!(
+        raw.contains("\u{1b}[?1049h"),
+        "the picker must enter the alternate screen"
+    );
+    assert!(
+        !raw.contains("\u{1b}[?1049l"),
+        "the picker must not leave the alternate screen while the setter waits"
+    );
+    session.release();
+    session.wait_for_all(&["MOCK-SET-1", "Default browser: Alpha"]);
+    session.send(b"\x1b");
+    session.finish();
+    assert!(
+        session.raw_output().contains("\u{1b}[?1049l"),
+        "the terminal must be restored on exit"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_wait_keeps_the_picker_open_and_reports_the_real_state() {
+    let mut session = pty::Session::start_blocked("block-cancel");
+    session.wait_for_all(&["Search", "Beta [current]"]);
+    session.send(b"\r");
+    session.wait_for_all(&[defbrow::ui::WAITING_STATUS, "MOCK-SET-BLOCKED"]);
+    // Ctrl-C stops the wait promptly; the fake setter would otherwise block for 30s.
+    session.send(b"\x03");
+    // The setter's own marker is the primary cancellation signal: waiting on the status
+    // text alone would only prove the wait ended, not that the hook stopped it.
+    session.wait_for_all(&[
+        "MOCK-SET-CANCELLED",
+        "Stopped waiting for approval.",
+        "HTTP: b; HTTPS: b",
+    ]);
+    assert!(
+        !session.raw_output().contains("\u{1b}[?1049l"),
+        "the picker must not leave the alternate screen to stop waiting"
+    );
+    // The picker is still live: typing a non-matching query redraws the list.
+    session.send(b"z");
+    session.wait_for("No matching browsers. Ctrl-U clears.");
+    session.send(b"\x1b");
+    session.finish();
+    assert!(
+        session.raw_output().contains("\u{1b}[?1049l"),
+        "the terminal must be restored on exit"
+    );
 }
 
 #[cfg(unix)]
@@ -484,13 +638,18 @@ fn native_picker_fixture() {
             https: Some("b".into()),
         }),
         fail_once: Cell::new(mode.starts_with("reject")),
-        expect_restored_terminal: true,
+        expect_picker_screen: true,
+        block_until_released: std::env::var_os("DEFBROW_TEST_RELEASE_FILE").map(PathBuf::from),
         ..Default::default()
     };
     execute(&backend, None, &mut Vec::new(), defbrow::ui::pick).unwrap();
     assert_eq!(
         backend.sets.get(),
-        if mode == "reject-cancel" { 1 } else { 2 }
+        match mode.as_str() {
+            "success" | "reject-once" => 2,
+            "reject-cancel" | "block-success" | "block-cancel" => 1,
+            other => panic!("unknown fixture mode: {other}"),
+        }
     );
     assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     println!("MOCK-SESSION-CANCELLED");
