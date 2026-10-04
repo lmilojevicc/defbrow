@@ -1,6 +1,10 @@
+use std::cell::RefCell;
+
+use anyhow::{bail, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use defbrow::{
-    backend::{Browser, CurrentDefaults},
+    backend::{Backend, Browser, Cancelled, CurrentDefaults},
+    execute,
     ui::{self, Picker, PickerAction},
 };
 use ratatui::{
@@ -21,6 +25,63 @@ fn browser(id: &str, name: &str, detail: &str) -> Browser {
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// Drives the real `switch_interactively` path (via `execute`) so rendered status
+/// text comes from production formatting: a wording change in `src/lib.rs` fails
+/// these tests instead of being mirrored by a hand-copied literal.
+struct StatusBackend {
+    current: RefCell<CurrentDefaults>,
+    cancel: Option<bool>,
+    fail: bool,
+}
+
+impl StatusBackend {
+    fn new(current: CurrentDefaults, cancel: Option<bool>, fail: bool) -> Self {
+        Self {
+            current: RefCell::new(current),
+            cancel,
+            fail,
+        }
+    }
+
+    /// Runs one real switch and returns the picker carrying the resulting status.
+    fn switched(&self) -> Picker {
+        let mut result = None;
+        execute(self, None, &mut Vec::new(), |mut picker, switch| {
+            let PickerAction::Select(browser) = picker.handle_key(key(KeyCode::Enter), true) else {
+                panic!("Expected selection");
+            };
+            switch(&mut picker, &browser);
+            result = Some(picker);
+            Ok(())
+        })
+        .unwrap();
+        result.unwrap()
+    }
+}
+
+impl Backend for StatusBackend {
+    fn browsers(&self) -> Result<Vec<Browser>> {
+        Ok(vec![browser("a", "Alpha", "fixture")])
+    }
+
+    fn current(&self) -> Result<CurrentDefaults> {
+        Ok(self.current.borrow().clone())
+    }
+
+    fn set_default(&self, browser: &Browser, _interrupted: &dyn Fn() -> bool) -> Result<()> {
+        if let Some(requested) = self.cancel {
+            return Err(Cancelled { requested }.into());
+        }
+        if self.fail {
+            bail!("Fixture rejection");
+        }
+        let mut current = self.current.borrow_mut();
+        current.http = Some(browser.id.clone());
+        current.https = Some(browser.id.clone());
+        Ok(())
+    }
 }
 
 #[test]
@@ -810,6 +871,50 @@ fn status_is_sanitized_inline_and_preserves_help_inset_and_selection() {
                     .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
             }
         }
+    }
+}
+
+#[test]
+fn render_shows_the_platform_waiting_status_set_on_the_picker() {
+    let mut picker = Picker::new(vec![browser("a", "Alpha", "")], CurrentDefaults::default());
+    picker.set_status(ui::WAITING_STATUS);
+    let buffer = render_buffer(&picker, false);
+    // Using the constant verbatim means a wording change fails this test.
+    assert_text_color(&buffer, 1, 17, ui::WAITING_STATUS, Color::Reset);
+}
+
+#[test]
+fn render_shows_switch_statuses_built_by_the_real_path() {
+    let readback = CurrentDefaults {
+        http: Some("b".into()),
+        https: Some("b".into()),
+    };
+    for (backend, expected) in [
+        (
+            StatusBackend::new(readback.clone(), None, false),
+            "Default browser: Alpha",
+        ),
+        (
+            StatusBackend::new(readback.clone(), None, true),
+            "Could not set Alpha",
+        ),
+        (
+            StatusBackend::new(readback.clone(), Some(true), false),
+            "Stopped waiting for approval. HTTP: b; HTTPS: b",
+        ),
+        (
+            StatusBackend::new(readback.clone(), Some(false), false),
+            "Stopped before requesting a change. HTTP: b; HTTPS: b",
+        ),
+    ] {
+        let picker = backend.switched();
+        assert!(
+            picker.status().contains(expected),
+            "status {:?} does not contain {expected:?}",
+            picker.status()
+        );
+        let buffer = render_buffer(&picker, false);
+        assert_text_color(&buffer, 1, 17, expected, Color::Reset);
     }
 }
 
