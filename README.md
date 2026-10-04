@@ -1,6 +1,6 @@
 # defbrow
 
-<img src="assets/cover.webp" alt="The defbrow picker: a Search field above a browser list reading Chrome, Helium [current], Zen, Safari and Firefox, with the selected row marked by a rail, and a footer reading: up/down move, Enter set, Esc cancel, Ctrl-U clear." width="760">
+<img src="assets/cover.webp" alt="A defbrow window over a blurred sunset desktop: a Search field above a browser list reading Chrome, Helium [current], Zen, Safari and Firefox, with the selected row marked by a rail, and a footer reading: up/down move, Enter set, Esc cancel, Ctrl-U clear." width="760">
 
 A small Rust CLI for choosing the default browser on macOS and Linux, with a searchable ratatui picker that inherits your terminal colors.
 
