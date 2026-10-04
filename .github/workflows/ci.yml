@@ -1,0 +1,52 @@
+# CI runs the canonical checks from docs/usage.md on both Linux and macOS.
+#
+# The ubuntu-latest leg is the mandatory one: src/backend/linux.rs is
+# #[cfg(target_os = "linux")] (and tests/linux_cli.rs is gated the same way), so
+# none of that code is compiled on a macOS development machine. Linux-only build,
+# lint and test breakage -- for example a signature change in the shared Backend
+# trait that misses call sites inside the Linux module's tests -- therefore passes
+# `cargo build` and the whole macOS test run locally while breaking `cargo test`
+# on the platform the crate advertises support for.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report both legs even when one fails; a Linux failure must not hide the
+      # macOS result, or vice versa.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test --locked
+        run: cargo test --locked
