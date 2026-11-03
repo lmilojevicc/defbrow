@@ -1,0 +1,12 @@
+# Fast local checks before every push. Install once per clone: `lefthook install`.
+# Linux-only code (src/backend/linux.rs) is not compiled on macOS; CI's ubuntu
+# leg stays the authority for it.
+pre-push:
+  parallel: true
+  jobs:
+    - name: fmt
+      glob: "*.rs"
+      run: cargo fmt --check
+    - name: clippy
+      glob: "*.{rs,toml}"
+      run: cargo clippy --locked --all-targets -- -D warnings
